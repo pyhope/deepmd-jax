@@ -5,12 +5,18 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges
-from .data import Dataset
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges, get_max_nbrs, neighborlist_is_efficient
+from .data import Dataset, compute_lattice_candidate
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
 import os
+
+def _get_static_args(type_idx, lattice_args):
+    return nn.FrozenDict({'type_idx': tuple(type_idx),
+                          'lattice': lattice_args,
+                          'use_neighborlist': lattice_args['use_neighborlist'],
+                          'max_nbrs': lattice_args['max_nbrs']})
 
 def train(
     model_type: str,
@@ -58,6 +64,7 @@ def train(
     obs_temperature: Union[float, list] = None,
     obs_target: Union[float, str, list, None] = None,
     obs_step_every: int = 1,
+    use_neighbor_list_when_possible: bool = True,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -105,6 +112,7 @@ def train(
             loss: loss function type, 'l1-mixed' or 'l2'.
                     'l1-mixed': MAE over configs/atoms, but RMS within each force/atomic vector; more robust to data outliers.
                     'l2': MSE over all entries. This was the old default.
+            use_neighbor_list_when_possible: use a simple training neighborlist when the lattice candidate count is one.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -161,7 +169,7 @@ def train(
     train_data = Dataset(train_data_path,
                            labels,
                            {'atomic_sel':atomic_sel})
-    train_data.compute_lattice_candidate(rcut)
+    train_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
     chemical_types = train_data.chemical_types
 
     # Setup for hybrid training
@@ -244,7 +252,8 @@ def train(
                                         labels_obs,
                                         {'atomic_sel':atomic_sel},
                                         chemical_types=chemical_types)
-            single_data_obs.compute_lattice_candidate(rcut)
+            single_data_obs.fill_type(train_data.ntypes)
+            single_data_obs.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
             train_data_obs.append(single_data_obs)
 
     use_val_data = val_data_path is not None
@@ -253,7 +262,8 @@ def train(
                              labels,
                              {'atomic_sel':atomic_sel},
                              chemical_types=chemical_types)
-        val_data.compute_lattice_candidate(rcut)
+        val_data.fill_type(train_data.ntypes)
+        val_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
     else:
         val_data = None
 
@@ -281,7 +291,8 @@ def train(
                                     dplr_beta,
                                     dplr_resolution,
                                     wc_model,
-                                    wc_variables)
+                                    wc_variables,
+                                    use_neighbor_list_when_possible=use_neighbor_list_when_possible)
         print(' Done. Time: %d s' % (time.time() - tic_sr))
 
     # construct model
@@ -316,7 +327,7 @@ def train(
 
     # initialize model variables
     batch, type_idx, lattice_args = train_data.get_batch(1)
-    static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
+    static_args = _get_static_args(type_idx, lattice_args)
     if seed is None:
         seed = np.random.randint(65536)
     variables = model.init(
@@ -479,13 +490,11 @@ def train(
             loss_val = []
             for one_batch in val_batch:
                 v_batch, type_idx, lattice_args = one_batch
-                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
-                                             'lattice': lattice_args})
+                static_args = _get_static_args(type_idx, lattice_args)
                 loss_val.append(val_step(v_batch, variables, static_args))
 
         batch, type_idx, lattice_args = get_batch_train()
-        static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
-                                     'lattice': lattice_args})
+        static_args = _get_static_args(type_idx, lattice_args)
         variables, opt_state, state = train_step(batch,
                                                  variables,
                                                  opt_state,
@@ -497,8 +506,7 @@ def train(
             # observable train step
             for i in range(len(obs_train_data_path)):
                 batch, type_idx, lattice_args = get_batch_train_obs(obs_position=i)
-                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
-                                            'lattice': lattice_args})
+                static_args = _get_static_args(type_idx, lattice_args)
                 variables, opt_state, state_obs = train_step_obs(batch,
                                                         variables,
                                                         opt_state,
@@ -548,7 +556,9 @@ def test(
                         labels,
                         {'atomic_sel': atomic_sel},
                         chemical_types=model.params.get('chemical_types'))
-    test_data.compute_lattice_candidate(model.params['rcut'])
+    test_data.fill_type(model.params['ntypes'])
+    test_data.compute_lattice_candidate(model.params['rcut'],
+                                        mp=model.params.get('use_mp', False))
     if 'dplr' in model.params['type']:
         subsets = test_data.get_flattened_data()
         for subset in subsets:
@@ -593,7 +603,7 @@ def test(
             batch, type_idx, lattice_args = leaf.get_batch(bs)
             remaining -= bs
 
-            static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
+            static_args = _get_static_args(type_idx, lattice_args)
             pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
             source_index = batch.get('_source_index')
 
@@ -788,17 +798,31 @@ def evaluate(
     }
     
 def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_resolution,
-                              wc_model, wc_variables, keep_long_range=False):
+                              wc_model, wc_variables, keep_long_range=False,
+                              use_neighbor_list_when_possible=True):
     '''
         subtracting long range energy and force, keeping short range part only, for dplr models.
     '''
-    data, type_idx, lattice_args = subset.values()
+    data, type_idx, _ = subset.values()
+    lattice_args = compute_lattice_candidate(data['box'], wc_model.params['rcut'])
     if not lattice_args['ortho']:
         raise ValueError('For "dplr" currently only orthorhombic boxes are supported.')
     type_idx = np.asarray(type_idx)
+    use_neighborlist = bool(use_neighbor_list_when_possible and
+                            len(lattice_args['lattice_cand']) == 1)
+    type_count = tuple(np.bincount(type_idx, minlength=wc_model.params['ntypes']))
+    max_nbrs = tuple(map(int, np.asarray(jax.jit(lambda coord, box:
+        get_max_nbrs(coord, box, tuple(type_idx), type_count,
+                     wc_model.params['rcut'], lattice_args['ortho']))(
+                         data['coord'], data['box'])))) if use_neighborlist else None
+    if max_nbrs is not None and not neighborlist_is_efficient(
+            max_nbrs, len(type_idx), wc_model.params.get('use_mp', False)):
+        use_neighborlist, max_nbrs = False, None
+    lattice_args.update({'use_neighborlist': use_neighborlist,
+                         'max_nbrs': max_nbrs})
     qatoms, qwc = dplr_charges(type_idx, dplr_q_atoms, dplr_q_wc,
                                wc_model.params['nsel'], wc_model.params['ntypes'])
-    static_args = nn.FrozenDict({'type_idx': tuple(type_idx), 'lattice': lattice_args})
+    static_args = _get_static_args(type_idx, lattice_args)
 
     def lr_energy(coord, box, Ngrid):
         wc = wc_model.wc_predict(wc_variables, coord, box, static_args)

@@ -17,23 +17,31 @@ class DPModel(nn.Module):
             nsel = [list(valid_types).index(i) for i in self.params['nsel']]
         else:
             nsel = list(range(len(type_count)))
-        K = jax.device_count() if nbrs_nm is not None else 1
+        K = 1 if static_args.get('use_neighborlist', False) else (jax.device_count() if nbrs_nm is not None else 1)
         coord = reorder_by_device(coord, type_idx, K=K)
         if nbrs_nm is not None:
             nbrs_nm = [[nbrs_nm[i][j] for j in valid_types] for i in valid_types]
             type_count_new = [-(-type_count[i]//K) for i in range(len(type_count))]
-            mask = get_mask_by_device(type_count)
+            mask = jnp.ones_like(coord[:,0]) if K == 1 else get_mask_by_device(type_count)
             return coord, type_count_new, mask, compress, K, nsel, nbrs_nm
         else:
             return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
             
     @nn.compact
     def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None):
+        if nbrs_nm is None and static_args.get('use_neighborlist', False):
+            type_idx = tuple(static_args['type_idx'])
+            type_count = tuple(np.bincount(type_idx, minlength=self.params['ntypes']))
+            nbrs_nm = get_neighbor_list(lax.stop_gradient(coord_N3),
+                                        lax.stop_gradient(box_33),
+                                        type_idx, type_count, self.params['rcut'],
+                                        static_args['max_nbrs'],
+                                        static_args['lattice']['ortho'])
         # prepare input parameters
         coord_N3, type_count, mask, compress, K, nsel, nbrs_nm = self.get_input(coord_N3, static_args, nbrs_nm)
         A, L = self.params['axis'], static_args['lattice']['lattice_max'] if nbrs_nm is None else None
         # compute relative coordinates x_3NM, distance r_NM, s(r) and normalized s(r)
-        x_n3m, r_nm = get_relative_coord(coord_N3, box_33, type_count, static_args.get('lattice',None), nbrs_nm)
+        x_n3m, r_nm = get_relative_coord(coord_N3, box_33, type_count, static_args.get('lattice',None), nbrs_nm, K)
         sr_nm = [[sr(r, self.params['rcut']) for r in R] for R in r_nm]
         sr_norm_nm = [[r/std for r in R] for R,std in zip(sr_nm,self.params['sr_std'])]
         sr_centernorm_nm = [[(r-mean)/std for r in R] for R,mean,std in zip(sr_nm,self.params['sr_mean'],self.params['sr_std'])]
@@ -57,7 +65,7 @@ class DPModel(nn.Module):
                         / self.params['Nnbrs'] for SR,R4 in zip(sr_centernorm_nm,R_n4m)] for _ in range(2)]
             T_2_nD = [[(t[:,:,None]*t[:,:,:4,None]).sum(1).reshape(-1,4*C) for t in T] for T in T_2_n4C]
             T_2_n3C = [[t[:,1:] for t in T] for T in T_2_n4C]
-            if nbrs_nm is not None:
+            if K > 1:
                 T_2_nD, T_2_n3C = lax.with_sharding_constraint([T_2_nD, T_2_n3C], PSpec())
             F_nselmE = [[(linear_norm(E)(T_2_nD[0][i])[:,None]
                       + (linear_norm(E)(T_2_nD[1][j])[nbrs_nm[i][j]] if nbrs_nm is not None else
@@ -157,4 +165,3 @@ class DPModel(nn.Module):
             return pref['obs']*lobs, (lobs, obs_avg, observable, logweights)
         loss_and_grad = value_and_grad(loss_obs, has_aux=True)
         return loss_obs, loss_and_grad
-

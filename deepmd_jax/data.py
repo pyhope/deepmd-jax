@@ -1,10 +1,12 @@
 import numpy as np
+import jax
 import jax.numpy as jnp
 from jax import vmap
 from glob import glob
 from os.path import abspath
+from time import time
 from ase.io import read
-from .utils import shift, get_relative_coord, sr
+from .utils import shift, get_relative_coord, get_neighbor_list, get_max_nbrs, neighborlist_is_efficient, sr
 
 
 def _classify_path(p):
@@ -118,21 +120,29 @@ class DatasetLeaf:
         return np.array(self.type_count)
 
     def fill_type(self, ntypes):
-        self.type_count = np.pad(self.type_count, (0, ntypes - self.ntypes))
+        self.type_count = np.pad(self.type_count, (0, ntypes - len(self.type_count)))
 
     def _get_stats(self, rcut, bs):
         if not hasattr(self, 'lattice_args'):
             raise AttributeError("lattice_args not set. Call compute_lattice_candidate(rcut) before get_stats.")
         batch = self.get_batch(bs)[0]
-        coord, box = batch['coord'], batch['box']
-        coord = coord[:, np.argsort(self.type_idx, kind='stable')]
-        r_Bnm = vmap(get_relative_coord, (0, 0, None, None))(coord, box, self.type_count, self.lattice_args)[1]
-        sr_BnM = [sr(jnp.concatenate(r, axis=-1), rcut) for r in r_Bnm]
-        sr_sum = np.array([sr.sum() for sr in sr_BnM])
-        sr_sum2 = np.array([(sr**2).sum() for sr in sr_BnM])
-        sr_count = np.array([(sr > 1e-15).sum() for sr in sr_BnM])
-        Nnbrs = (np.concatenate(sr_BnM, axis=1) > 0).sum(2).mean() + 1
-        return np.array([sr_sum, sr_sum2, sr_count, Nnbrs * np.ones_like(sr_sum)])
+        type_idx, type_count = tuple(self.type_idx), tuple(self.type_count)
+        def one_frame(coord, box):
+            nbrs_nm = get_neighbor_list(coord, box, type_idx, type_count, rcut,
+                                        self.lattice_args['max_nbrs'],
+                                        self.lattice_args['ortho']) \
+                       if self.lattice_args['use_neighborlist'] else None
+            coord = coord[np.argsort(type_idx, kind='stable')]
+            r_nm = get_relative_coord(coord, box, type_count, self.lattice_args, nbrs_nm, K=1)[1]
+            sr_nM = [sr(jnp.concatenate(r, axis=-1), rcut) for r in r_nm]
+            sr_sum = jnp.array([s.sum() for s in sr_nM])
+            sr_sum2 = jnp.array([(s**2).sum() for s in sr_nM])
+            sr_count = jnp.array([(s > 1e-15).sum() for s in sr_nM])
+            Nnbrs = (jnp.concatenate(sr_nM, axis=0) > 0).sum(1).mean() + 1
+            return jnp.array([sr_sum, sr_sum2, sr_count, Nnbrs*jnp.ones_like(sr_sum)])
+        s = np.array(jax.jit(lambda coord, box: jax.lax.map(lambda x: one_frame(*x), (coord, box)))
+                     (batch['coord'], batch['box']))
+        return np.concatenate([s[:,:3].sum(0), s[:,3:].mean(0)], axis=0)
 
     def get_stats(self, rcut, bs):
         self.params = {'ntypes': self.ntypes, 'rcut': rcut}
@@ -161,8 +171,25 @@ class DatasetLeaf:
         self.pointer += batch_size
         return batch, tuple(self.type_idx), self.lattice_args
 
-    def compute_lattice_candidate(self, rcut):
+    def compute_lattice_candidate(self, rcut, use_neighbor_list_when_possible=True, mp=False):
         self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
+        use_neighborlist = bool(use_neighbor_list_when_possible and
+                                len(self.lattice_args['lattice_cand']) == 1)
+        if use_neighborlist:
+            type_idx, type_count = tuple(self.type_idx), tuple(self.type_count)
+            tic = time()
+            max_nbrs = jax.jit(lambda coord, box:
+                get_max_nbrs(coord, box, type_idx, type_count, rcut,
+                             self.lattice_args['ortho']))(self.data['coord'], self.data['box'])
+            max_nbrs = tuple(map(int, np.array(max_nbrs)))
+            print('# Neighborlist max neighbors per type:', max_nbrs,
+                  'Time: %.2f s' % (time() - tic))
+            if not neighborlist_is_efficient(max_nbrs, self.natoms, mp):
+                use_neighborlist, max_nbrs = False, None
+        else:
+            max_nbrs = None
+        self.lattice_args.update({'use_neighborlist': use_neighborlist,
+                                  'max_nbrs': max_nbrs})
 
     def fit_energy(self):
         energy_stats = self._get_energy_stats()
@@ -252,9 +279,9 @@ class DatasetGroup:
         subset = np.random.choice(len(self.subsets), p=self.prob)
         return self.subsets[subset].get_batch(batch_size, type)
 
-    def compute_lattice_candidate(self, rcut):
+    def compute_lattice_candidate(self, rcut, use_neighbor_list_when_possible=True, mp=False):
         for subset in self.subsets:
-            subset.compute_lattice_candidate(rcut)
+            subset.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
 
     def fit_energy(self):
         energy_stats = self._get_energy_stats()

@@ -51,9 +51,10 @@ def concat(array_list, axis=0, K=1): # concatenate subarray into list of arrays 
 def tensor_3to6(x, axis, bias=0):
     return jnp.concatenate([x**2-bias, 2**0.5 * x * jnp.roll(x,shift=1,axis=axis)], axis=axis)
 
-def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None):
+def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None, K=None):
     x_n3m, r_nm = [], []
-    coord_n3 = split(coord_N3, type_count, K=(1 if nbrs_nm is None else jax.device_count()))
+    K = 1 if nbrs_nm is None else (jax.device_count() if K is None else K)
+    coord_n3 = split(coord_N3, type_count, K=K)
     for i in range(len(type_count)):
         x, r = [], []
         for j in range(len(type_count)):
@@ -77,7 +78,8 @@ def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None)
                             x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
                     r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1)
                 else:
-                    x_N3M = shift(coord_n3[j][nbrs_nm[i][j]] - coord_n3[i][:,None], box_33, True).transpose(0,2,1)
+                    ortho = True if lattice_args is None else lattice_args['ortho']
+                    x_N3M = shift(coord_n3[j][nbrs_nm[i][j]] - coord_n3[i][:,None], box_33, ortho).transpose(0,2,1)
                     r_NM = jnp.linalg.norm(jnp.where(jnp.abs(x_N3M) > 1e-15, x_N3M, 1e-15), axis=1) * (nbrs_nm[i][j] < len(coord_n3[j]))
                     x_N3M = x_N3M * (nbrs_nm[i][j] < len(coord_n3[j]))[:,None]
             x.append(x_N3M)
@@ -350,6 +352,43 @@ def reorder_by_device(coord, type_idx, K=None):
                     for c in split(coord, type_count)
                 ], axis=1).reshape(-1, *coord.shape[1:])
     return jax.lax.with_sharding_constraint(coord, PSpec())
+
+
+def _neighbor_mask(coord, box, type_idx, rcut, ortho):
+    coord = reorder_by_device(coord, type_idx, K=1)
+    x_NM3 = shift(coord[None] - coord[:,None], box, ortho)
+    return ((x_NM3**2).sum(-1) < rcut**2) & ~jnp.eye(len(coord), dtype=bool)
+
+
+def get_neighbor_list(coord, box, type_idx, type_count, rcut, max_nbrs, ortho):
+    mask_NM = _neighbor_mask(coord, box, type_idx, rcut, ortho)
+    type_split = np.cumsum((0,) + tuple(type_count))
+    nbrs_mn = []
+    for j, max_nbr in enumerate(max_nbrs):
+        if max_nbr:
+            n_j = type_count[j]
+            idx_NM = jnp.where(mask_NM[:,type_split[j]:type_split[j+1]], jnp.arange(n_j), n_j)
+            idx_NM = jnp.concatenate([idx_NM, jnp.full((len(coord), max_nbr), n_j, dtype=idx_NM.dtype)], axis=1)
+            idx_NM = -lax.top_k(-idx_NM, max_nbr)[0]
+        else:
+            idx_NM = jnp.empty((len(coord), 0), dtype=jnp.int32)
+        nbrs_mn.append(split(idx_NM, type_count))
+    return [list(nbrs_m) for nbrs_m in zip(*nbrs_mn)]
+
+
+def get_max_nbrs(coord, box, type_idx, type_count, rcut, ortho):
+    coord, box = jnp.asarray(coord), jnp.asarray(box)
+    type_split = np.cumsum((0,) + tuple(type_count))
+    def body(i, max_nbrs):
+        mask_NM = _neighbor_mask(coord[i], box[i], type_idx, rcut, ortho)
+        n = jnp.array([mask_NM[:,type_split[j]:type_split[j+1]].sum(1).max()
+                       for j in range(len(type_count))])
+        return jnp.maximum(max_nbrs, n)
+    return lax.fori_loop(0, len(coord), body, jnp.zeros(len(type_count), dtype=int))
+
+
+def neighborlist_is_efficient(max_nbrs, natoms, mp):
+    return (3 if mp else 2) * sum(max_nbrs) <= natoms
 
 
 def dplr_charges(type_idx, q_atoms, q_wc, nsel, ntypes):
