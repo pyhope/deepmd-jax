@@ -6,7 +6,7 @@ import time, datetime
 import flax.linen as nn
 from functools import partial
 from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, dplr_charges, get_max_nbrs, neighborlist_is_efficient
-from .data import Dataset, compute_lattice_candidate
+from .data import Dataset, compute_lattice_candidate, get_atomic_scalar_stats
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
@@ -74,6 +74,7 @@ def train(
                  'energy' (standard force field),
                  'atomic' (predicts per-atom 3-vectors, e.g. Wannier centroid),
                  'atomic_t2' (predicts per-atom symmetric 3x3 tensors, e.g. polarizability),
+                 'atomic_scalar' (predicts one invariant scalar per selected atom),
                  'dplr' (force field w/ long-range electrostatics).
             rcut: cutoff radius (Angstrom) for the model.
             save_path: path to save the trained model.
@@ -81,17 +82,17 @@ def train(
             val_data: path to validation data (str) or list of paths to validation data (List[str]).
             step: number of training steps. Depending on dataset size, expect 1e5-1e7 for energy models and 1e5-1e6 for wannier models.
             mp: whether to use message passing model for more accuracy at a higher cost.
-            atomic_sel: Selects the atom types for prediction. Only used when model_type == 'atomic' or 'atomic_t2'.
+            atomic_sel: Selects the atom types for prediction. Must be provided for atomic models.
             embed_widths: Widths of the embedding neural network.
             embed_mp_widths: Widths of the embedding neural network in message passing. Only used when mp == True.
             fit_widths: Widths of the fitting neural network.
             axis_neurons: Number of axis neurons to project the atomic features before the fitting network. Recommended range: 8-16.
-            lr: learning rate at start. If None, default values (0.002 for 'energy' and 0.01 for 'atomic'/'atomic_t2') is used.
+            lr: learning rate at start. If None, defaults to 0.002 for energy and 0.01 for atomic models.
             batch_size: training batch size in number of frames. If None, will be automatically determined by label_bs.
             val_batch_size_ratio: validation batch size / batch_size. Increase for stabler validation loss.
             compress: whether to compress the model after training for faster inference.
             print_every: interval for printing loss and validation.
-            atomic_data_prefix: prefix for .npy label files. Defaults to 'atomic_dipole' for 'atomic' and 'atomic_polarizability' for 'atomic_t2'.
+            atomic_data_prefix: prefix for .npy label files. Defaults to 'atomic_dipole', 'atomic_polarizability', or 'atomic_energy'.
             s_pref_e: starting prefactor for energy loss.
             l_pref_e: limit prefactor for energy loss.
             s_pref_f: starting prefactor for force loss.
@@ -130,7 +131,7 @@ def train(
 
     # width check
     if fit_widths is None:
-        if 'atomic' not in model_type:
+        if model_type not in ('atomic', 'atomic_t2'):
             fit_widths = [128, 128, 128]
         else:
             width = embed_mp_widths[-1] if mp else embed_widths[-1]
@@ -147,7 +148,7 @@ def train(
     for i in range(len(fit_widths)-1):
         if fit_widths[i+1] != fit_widths[i] != 0:
             print('# Warning: it is recommended to use the same width for all layers in the fitting network.')
-    if 'atomic' in model_type:
+    if model_type in ('atomic', 'atomic_t2'):
         if mp:
             if embed_mp_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic mp models, embed_mp_widths[-1] must equal fit_widths[-1].')
@@ -157,18 +158,19 @@ def train(
     assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
-        atomic_data_prefix = 'atomic_dipole' if model_type == 'atomic' else 'atomic_polarizability'
+        atomic_data_prefix = {'atomic':'atomic_dipole', 'atomic_t2':'atomic_polarizability', 'atomic_scalar':'atomic_energy'}[model_type]
     if model_type in ('energy', 'dplr'):
         labels = ['coord', 'box', 'force', 'energy']
     elif 'atomic' in model_type:
         labels = ['coord', 'box', atomic_data_prefix]
         print(f'# Using {atomic_data_prefix}.npy as dataset labels.')
-        assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic"/"atomic_t2".'
+        assert type(atomic_sel) == list, ' Must provide atomic_sel properly for an atomic model.'
     else:
-        raise ValueError('model_type should be "energy", "atomic", "atomic_t2", or "dplr".')
+        raise ValueError('model_type should be "energy", "atomic", "atomic_t2", "atomic_scalar", or "dplr".')
+    data_params = {'atomic_sel':atomic_sel, 'atomic_scalar':model_type == 'atomic_scalar'}
     train_data = Dataset(train_data_path,
                            labels,
-                           {'atomic_sel':atomic_sel})
+                           data_params)
     train_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
     chemical_types = train_data.chemical_types
 
@@ -250,7 +252,7 @@ def train(
         for i in range(n_paths):
             single_data_obs = Dataset(obs_train_data_path[i],
                                         labels_obs,
-                                        {'atomic_sel':atomic_sel},
+                                        data_params,
                                         chemical_types=chemical_types)
             single_data_obs.fill_type(train_data.ntypes)
             single_data_obs.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
@@ -260,7 +262,7 @@ def train(
     if use_val_data:
         val_data = Dataset(val_data_path,
                              labels,
-                             {'atomic_sel':atomic_sel},
+                             data_params,
                              chemical_types=chemical_types)
         val_data.fill_type(train_data.ntypes)
         val_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
@@ -295,6 +297,8 @@ def train(
                                     use_neighbor_list_when_possible=use_neighbor_list_when_possible)
         print(' Done. Time: %d s' % (time.time() - tic_sr))
 
+    scalar_stats = get_atomic_scalar_stats(train_data, atomic_sel) if model_type == 'atomic_scalar' else None
+
     # construct model
     params = {
         'type': model_type,
@@ -303,14 +307,14 @@ def train(
         'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
         'fit_widths': fit_widths,
         'axis': axis_neurons,
-        'Ebias': None if 'atomic' in model_type else train_data.fit_energy(),
+        'Ebias': scalar_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
         'rcut': rcut,
         'use_2nd': True,
         'use_mp': mp,
         'atomic': 'atomic' in model_type,
         'hybrid': hybrid,
         'nsel': atomic_sel if 'atomic' in model_type else None,
-        'out_norm': train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.,
+        'out_norm': scalar_stats[1] if model_type == 'atomic_scalar' else (train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.),
         **train_data.get_stats(rcut, getstat_bs),
     }
     if model_type == 'dplr':
@@ -551,10 +555,10 @@ def test(
         labels = ['coord', 'box', model.params['atomic_data_prefix']]
         atomic_sel = model.params['nsel']
     else:
-        raise ValueError('Model type should be "energy", "atomic", "atomic_t2", or "dplr".')
+        raise ValueError('Model type should be "energy", "atomic", "atomic_t2", "atomic_scalar", or "dplr".')
     test_data = Dataset(data_path,
                         labels,
-                        {'atomic_sel': atomic_sel},
+                        {'atomic_sel': atomic_sel, 'atomic_scalar': model.params['type'] == 'atomic_scalar'},
                         chemical_types=model.params.get('chemical_types'))
     test_data.fill_type(model.params['ntypes'])
     test_data.compute_lattice_candidate(model.params['rcut'],
@@ -674,7 +678,7 @@ def test(
                 stats[key]['sq'] += (diff**2).sum()
                 stats[key]['abs'] += np.abs(diff).sum()
                 stats[key]['count'] += diff.size
-                per_atom = (diff**2).mean(-1)**0.5
+                per_atom = (diff**2).mean(tuple(range(2,diff.ndim)))**0.5
                 stats['l1_sum'] += per_atom.sum()
                 stats['l1_count'] += per_atom.size
 
@@ -775,7 +779,7 @@ def evaluate(
         if 'atomic' in model.params['type']:
             atomic_path = os.path.join(set_dir, model.params['atomic_data_prefix'] + ".npy")
             label_count = np.isin(type_idx, model.params['nsel']).sum()
-            label_dim = 9 if model.params['type'] == 'atomic_t2' else 3
+            label_dim = {'atomic_t2':9, 'atomic':3, 'atomic_scalar':1}[model.params['type']]
             np.save(atomic_path, np.zeros((coord.shape[0], label_count * label_dim)))
         elif model.params['type'] in ('energy', 'dplr'):
             energy_path = os.path.join(set_dir, "energy.npy")

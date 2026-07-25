@@ -133,7 +133,9 @@ train(
       step=100000,                           # Number of training steps
 )
 ```
-This model predicts an O(3)-equivariant 3-vector or 9-vector (as a flattened symmetric 3x3 matrix) for each atom within the selected type (`atomic_sel`). For `model_type='atomic'`, the argument `atomic_data_prefix` in `train()` is set to `'atomic_dipole'` by default, meaning `"atomic_dipole.npy"` is the expected label filename in your dataset. For `model_type='atomic_t2'`, it defaults to `'atomic_polarizability'`. If you need to specify a different prefix, it needs to be `'atomic_*'`.
+This model predicts an O(3)-equivariant 3-vector or 9-vector (as a flattened symmetric 3x3 matrix) for each atom within the selected type (`atomic_sel`). For `model_type='atomic'`, the argument `atomic_data_prefix` in `train()` is set to `'atomic_dipole'` by default, meaning `"atomic_dipole.npy"` is the expected label filename in your DeepMD-kit format dataset. For `model_type='atomic_t2'`, it defaults to `'atomic_polarizability'`. If you need to specify a different prefix, it needs to be `'atomic_*'`.
+
+For an invariant scalar on each selected atom, use `model_type='atomic_scalar'`. Its label prefix defaults to `atomic_energy` with data shape `(nframes, n_selected_atoms)`.
 
 ### Training a DPLR Model
 ```python

@@ -84,28 +84,28 @@ class DPModel(nn.Module):
         if self.params['use_2nd']:
             G2_axis_Nsel6A = tensor_3to6(T_Nsel3W[:,:,A:2*A], axis=1) + T_Nsel6W[:,:,A:2*A]
             G_NselAW += (G2_axis_Nsel6A[...,None] * T_Nsel6W[:,:,None]).sum(1)
+        debug = T_NselXW
         if not self.params['atomic']: # Energy prediction
             fit_n1 = [fitting_net(self.params['fit_widths'])(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),type_count,0,K=K)]
             pred = (mask * concat([f[:,0]+Eb for f,Eb in zip(fit_n1,self.params['Ebias'])], K=K)).sum()
-        else: # Atomic tensor prediction
+        else: # Atomic prediction
             sel_count = [type_count[i] for i in nsel]
-            fit_nselW = [fitting_net(self.params['fit_widths'], use_final=False)(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
-            if self.params['type'] == 'atomic_t2':
-                T_NselYW = (T_Nsel6W + tensor_3to6(T_Nsel3W, axis=1) + T_NselW[:,None] * jnp.array([1,1,1,0,0,0])[:,None])
-            elif self.params['type'] == 'atomic':
-                T_NselYW = T_Nsel3W
-            T_nselYW = split(T_NselYW, sel_count, 0, K=K)
+            fit_nselW = [fitting_net(self.params['fit_widths'], use_final=self.params['type'] == 'atomic_scalar')(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
             real_type_count = np.bincount(static_args['type_idx'], minlength=self.params['ntypes'])
-            pred = [(f[:,None]*T).sum(-1)[:real_type_count[self.params['nsel'][i]]] for i,(f,T) in enumerate(zip(fit_nselW,T_nselYW))]
+            if self.params['type'] == 'atomic_scalar':
+                pred = [f[:real_type_count[t],0] * self.params['out_norm'] + self.params['Ebias'][t] for t,f in zip(self.params['nsel'],fit_nselW)]
+            else:
+                T_NselYW = ((T_Nsel6W + tensor_3to6(T_Nsel3W, axis=1) + T_NselW[:,None] * jnp.array([1,1,1,0,0,0])[:,None])
+                             if self.params['type'] == 'atomic_t2' else T_Nsel3W)
+                T_nselYW = split(T_NselYW, sel_count, 0, K=K)
+                pred = [(f[:,None]*T).sum(-1)[:real_type_count[t]] for t,f,T in zip(self.params['nsel'],fit_nselW,T_nselYW)]
+                debug = T_NselYW
             pred = concat([lax.with_sharding_constraint(p, PSpec()) if K > 1 else p for p in pred])
             pred = pred[atomic_inverse_perm(static_args['type_idx'], self.params['nsel'])]
             if self.params['type'] == 'atomic_t2': # tensor_6to9
                 s = 2**-0.5
                 pred = pred[:, [0,4,3,4,1,5,3,5,2]] * jnp.array([1,s,s,s,1,s,s,s,1])
-            debug = T_NselYW
-        if not self.params['atomic']:
-            debug = T_NselXW
-        return pred * self.params['out_norm'], debug
+        return (pred if self.params['type'] == 'atomic_scalar' else pred * self.params['out_norm']), debug
 
     def energy(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
         pred, _ = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)
@@ -143,7 +143,7 @@ class DPModel(nn.Module):
                 if order == 'l2':
                     return ((batch_data['atomic'] - pred)**2).mean()
                 elif order == 'l1-mixed':
-                    sq = ((batch_data['atomic'] - pred)**2).mean(-1)
+                    sq = ((batch_data['atomic'] - pred)**2).mean(tuple(range(2,pred.ndim)))
                     return jnp.where(sq > 0, jnp.sqrt(jnp.where(sq > 0, sq, 1.)), 0.).mean()
             loss_and_grad = value_and_grad(loss_atomic)
             return loss_atomic, loss_and_grad

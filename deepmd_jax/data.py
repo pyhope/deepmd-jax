@@ -106,10 +106,10 @@ class DatasetLeaf:
                 self.data[l] = self.data[l].reshape(-1)
             if 'atomic' in l:
                 try:
-                    self.data[l] = self.data[l].reshape(self.data[l].shape[0], self.nlabels, -1)
-                    assert self.data[l].shape[2] in (3, 9)
+                    self.data[l] = self.data[l].reshape(self.data[l].shape[0], self.nlabels) if params.get('atomic_scalar', False) else self.data[l].reshape(self.data[l].shape[0], self.nlabels, -1)
+                    assert params.get('atomic_scalar', False) or self.data[l].shape[2] in (3, 9)
                 except Exception:
-                    raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
+                    raise ValueError('Atomic scalar label must have 1 component per atom.' if params.get('atomic_scalar', False) else 'Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
         self.data['box'] = self.data['box'].reshape(-1, 3, 3)
         self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
         if paths is not None:
@@ -201,6 +201,16 @@ class DatasetLeaf:
         label = [label for label in self.data.keys() if 'atomic' in label][0]
         return np.std(self.data[label])
 
+    def _get_atomic_scalar_stats(self, atomic_sel):
+        label = self.data[next(label for label in self.data if 'atomic' in label)]
+        label_types = self.type_idx[np.isin(self.type_idx, atomic_sel)]
+        ntypes = len(self.type_count)
+        return np.array([
+            len(label) * np.bincount(label_types, minlength=ntypes),
+            np.bincount(label_types, label.sum(0,dtype=np.float64), minlength=ntypes),
+            np.bincount(label_types, np.einsum('ij,ij->j',label,label,dtype=np.float64), minlength=ntypes)
+        ])[:,atomic_sel]
+
     def _get_energy_stats(self):
         return [(self.type_count, self.data['energy'].mean())]
 
@@ -226,6 +236,20 @@ class DPDataset(DatasetLeaf):
             for l in labels
         }
         super().__init__(labels, params or {}, type_arr, data, paths=[path])
+
+
+def get_atomic_scalar_stats(dataset, atomic_sel):
+    if not atomic_sel or any(t < 0 or t >= dataset.ntypes for t in atomic_sel):
+        raise ValueError('atomic_sel must contain types present in the training dataset.')
+    count, label_sum, label_sum2 = sum(leaf._get_atomic_scalar_stats(atomic_sel) for leaf in dataset.get_leaves())
+    if not count.all():
+        raise ValueError('No atomic scalar labels found for selected type(s) %s.'
+                         % np.asarray(atomic_sel)[count == 0].tolist())
+    Ebias = np.zeros(dataset.ntypes, dtype=np.float32)
+    Ebias[atomic_sel] = label_sum / count
+    variance = (label_sum2 - label_sum**2 / count).sum() / count.sum()
+    out_norm = np.sqrt(max(variance, 0.))
+    return Ebias, np.float32(out_norm if out_norm > 0 else 1.)
 
 
 class DatasetGroup:
