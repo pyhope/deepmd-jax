@@ -29,6 +29,11 @@ cd deepmd-jax
 pip install -e .
 ```
 
+This local reliability branch pins the JAX-compatible `jax-md` source archive
+to commit `a41c7d19f6468f4e5263c32c12c9ed6cba26ebff`. The archive URL avoids the
+Git LFS download failure that currently affects a direct clone of `jax-md`,
+while the commit pin prevents an unreviewed dependency change between runs.
+
 ## Hardware Requirements
 
 It is recommended to have one GPU for training and one or more GPUs for simulation. For common `float32` jobs, the RTX 4090/5090 is most cost-effective.
@@ -53,6 +58,43 @@ train(
 ```
 
 The default values for the other arguments in [`train()`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/train.py) like learning rate, batch size, model width, etc. are usually a solid baseline. The one parameter you may want to change is `mp=True` to enable DP-MP for better accuracy.
+
+### Reliable segmented training in this local branch
+
+`step` is the exact total optimizer-update target. A run can checkpoint and
+stop after a bounded number of updates, then resume without changing its
+optimizer, learning-rate, RNG, validation sampler, or training sampler state:
+
+```python
+common = dict(
+    model_type='energy',
+    rcut=6.0,
+    train_data_path=train_paths,
+    val_data_path=validation_paths,
+    save_path='dpmp.pkl',
+    step=500_000,
+    seed=20260901,
+    mp=True,
+    checkpoint_path='dpmp.train.pkl',
+    checkpoint_every=1_000,
+    max_updates_per_run=20_000,
+)
+
+status = train(**common)
+while not status['completed']:
+    status = train(**common, resume=True)
+```
+
+Checkpoints and final models are written atomically with adjacent SHA256
+sidecars. A checkpoint records complete model/optimizer state, the exact
+learning-rate update, all dataset pointers and permutations, and dataset RNG
+states. Resume fails closed on a checksum error or changed training contract.
+The atomic JSON history defaults to `save_path + '.history.json'`.
+
+The current energy-model interface still trains energy and force only. It can
+derive stress for ASE/MD use, but does not load virial labels into the loss.
+It also does not consume DeepMD `fparam.npy`; comparisons requiring a frame
+parameter need a separate, explicitly tested extension.
 
 ### Step 3: Perform a Simulation
 
