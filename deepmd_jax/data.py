@@ -438,19 +438,25 @@ class ExtXYZDataset(DatasetGroup):
 
 def compute_lattice_candidate(boxes, rcut, print_info=True, disable_ortho=False):
     N = 2  # This algorithm is heuristic and subject to change. Increase N in case of missing neighbors.
-    ortho = not vmap(lambda box: box - jnp.diag(jnp.diag(box)))(boxes).any()
-    recp_norm = jnp.linalg.norm((jnp.linalg.inv(boxes)), axis=-1)
+    dtype = np.float64 if jax.config.x64_enabled else np.float32
+    boxes = np.asarray(boxes, dtype=dtype).reshape(-1, 3, 3)
+    diagonal_boxes = np.eye(3, dtype=dtype)[None] * np.diagonal(
+        boxes, axis1=1, axis2=2)[:, None, :]
+    ortho = bool(np.array_equal(boxes, diagonal_boxes))
+    recp_norm = np.linalg.norm(np.linalg.inv(boxes), axis=-1)
     n = np.ceil(rcut * recp_norm - 0.5).astype(int).max(0)
-    lattice_cand = jnp.stack(
+    lattice_cand = np.stack(
         np.meshgrid(range(-n[0], n[0] + 1), range(-n[1], n[1] + 1), range(-n[2], n[2] + 1), indexing='ij'),
         axis=-1).reshape(-1, 3)
-    trial_points = jnp.stack(np.meshgrid(np.arange(-N, N + 1), np.arange(-N, N + 1), np.arange(-N, N + 1)),
-                             axis=-1).reshape(-1, 3) / (2 * N)
-    is_neighbor = jnp.linalg.norm((lattice_cand[:, None] - trial_points)[None] @ boxes[:, None], axis=-1) < rcut
-    lattice_cand = np.array(lattice_cand[is_neighbor.any((0, 2))])
-    lattice_max = is_neighbor.sum(1).max().item()
+    trial_points = np.stack(
+        np.meshgrid(np.arange(-N, N + 1), np.arange(-N, N + 1),
+                    np.arange(-N, N + 1)), axis=-1).reshape(-1, 3) / (2 * N)
+    delta = np.asarray(lattice_cand[:, None] - trial_points, dtype=dtype)
+    is_neighbor = np.linalg.norm(delta[None] @ boxes[:, None], axis=-1) < rcut
+    lattice_cand = lattice_cand[is_neighbor.any(axis=(0, 2))]
+    lattice_max = int(is_neighbor.sum(axis=1).max())
     if print_info:
         print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (lattice_max, len(lattice_cand)))
-    return {'lattice_cand': tuple(map(tuple, lattice_cand)),
+    return {'lattice_cand': tuple(tuple(map(int, row)) for row in lattice_cand),
             'lattice_max': lattice_max,
             'ortho': ortho if not disable_ortho else False}
