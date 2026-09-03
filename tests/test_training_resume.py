@@ -279,6 +279,40 @@ def test_exact_signature_prewarm_preserves_training_trajectory(tmp_path):
         (tmp_path / 'prewarm.history.json').read_text())
 
 
+def test_exact_signature_prewarm_can_select_process_isolated_shards(tmp_path):
+    dataset = tmp_path / 'dataset'
+    _write_dataset(dataset)
+    kwargs = _train_kwargs(
+        dataset, tmp_path / 'unused.pkl', tmp_path / 'unused.train.pkl',
+        tmp_path / 'unused.history.json')
+
+    train_only = train(
+        **kwargs, prewarm_updates=4, prewarm_only=True,
+        prewarm_train_signature_indices=[0],
+        prewarm_validation_signature_indices=[])
+    assert train_only['prewarm_train_signatures'] == 1
+    assert train_only['prewarm_train_signatures_discovered'] == 1
+    assert train_only['prewarm_train_signature_indices'] == [0]
+    assert train_only['prewarm_validation_signatures'] == 0
+    assert train_only['prewarm_validation_signatures_discovered'] == 1
+    assert train_only['prewarm_validation_signature_indices'] == []
+
+    validation_only = train(
+        **kwargs, prewarm_updates=4, prewarm_only=True,
+        prewarm_train_signature_indices=[],
+        prewarm_validation_signature_indices=[0])
+    assert validation_only['prewarm_train_signatures'] == 0
+    assert validation_only['prewarm_validation_signatures'] == 1
+    assert validation_only['prewarm_validation_signature_indices'] == [0]
+
+    with pytest.raises(IndexError, match='Training signature index'):
+        train(
+            **kwargs, prewarm_updates=4, prewarm_only=True,
+            prewarm_train_signature_indices=[1])
+    with pytest.raises(ValueError, match='require prewarm_updates'):
+        train(**kwargs, prewarm_train_signature_indices=[0])
+
+
 def test_dpmp_train_save_reload_and_test(tmp_path):
     dataset = tmp_path / 'dataset'
     _write_dataset(dataset)

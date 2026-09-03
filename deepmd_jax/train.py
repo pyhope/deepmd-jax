@@ -168,6 +168,8 @@ def train(
     history_path: str = None,
     prewarm_updates: int = None,
     prewarm_only: bool = False,
+    prewarm_train_signature_indices: List[int] = None,
+    prewarm_validation_signature_indices: List[int] = None,
     model_params_path: str = None,
 ):
     '''
@@ -228,6 +230,14 @@ def train(
                 Sampler, optimizer, model, and history state are restored unchanged.
             prewarm_only: exit after prewarming without performing or checkpointing
                 any training update. Requires prewarm_updates.
+            prewarm_train_signature_indices: optionally compile only these
+                zero-based training-signature indices from the exact sampled
+                trajectory. This supports process-isolated cache construction;
+                requires prewarm_updates.
+            prewarm_validation_signature_indices: optionally compile only these
+                zero-based validation-signature indices from the exact sampled
+                trajectory. An empty list skips validation compilation; requires
+                prewarm_updates.
             model_params_path: optional content-addressed pickle of exact static
                 model parameters for a cross-backend resume. The file and its
                 SHA256 sidecar are required, locally recomputed data statistics
@@ -255,6 +265,10 @@ def train(
         raise ValueError('prewarm_updates must be positive.')
     if prewarm_only and prewarm_updates is None:
         raise ValueError('prewarm_only requires prewarm_updates.')
+    if (prewarm_updates is None
+            and (prewarm_train_signature_indices is not None
+                 or prewarm_validation_signature_indices is not None)):
+        raise ValueError('Prewarm signature indices require prewarm_updates.')
     if model_params_path is not None and not resume:
         raise ValueError('model_params_path is only valid when resuming.')
     if model_params_path is not None and model_type != 'energy':
@@ -727,13 +741,31 @@ def train(
             dataset.set_sampler_state(sampler_state)
         return signature_batches
 
+    def select_signature_batches(signature_batches, indices, label):
+        """Select deterministic signature shards while preserving discovery order."""
+        if indices is None:
+            return signature_batches, list(range(len(signature_batches)))
+        indices = list(indices)
+        if any(isinstance(index, bool) or not isinstance(index, (int, np.integer))
+               for index in indices):
+            raise TypeError('%s signature indices must be integers.' % label)
+        indices = [int(index) for index in indices]
+        if len(indices) != len(set(indices)):
+            raise ValueError('%s signature indices must be unique.' % label)
+        if any(index < 0 or index >= len(signature_batches) for index in indices):
+            raise IndexError(
+                '%s signature index is outside [0, %d).' %
+                (label, len(signature_batches)))
+        items = list(signature_batches.items())
+        return dict(items[index] for index in indices), indices
+
     prewarm_summary = None
     if prewarm_updates is not None:
         prewarm_tic = time.time()
         prewarm_start = int(np.asarray(state['iteration']))
         prewarm_stop = min(step, prewarm_start + prewarm_updates)
         planned_updates = prewarm_stop - prewarm_start
-        train_signature_batches = collect_signature_batches(
+        all_train_signature_batches = collect_signature_batches(
             train_data, get_batch_train, planned_updates)
 
         val_calls = 0
@@ -742,14 +774,21 @@ def train(
                 completed % print_every == 0 or completed == step
                 for completed in range(prewarm_start + 1, prewarm_stop + 1))
             val_calls = report_count * val_batch_size_ratio
-            val_signature_batches = collect_signature_batches(
+            all_val_signature_batches = collect_signature_batches(
                 val_data,
                 lambda: val_data.get_batch(
                     label_bs if batch_size is None else batch_size,
                     'label' if batch_size is None else 'frame'),
                 val_calls)
         else:
-            val_signature_batches = {}
+            all_val_signature_batches = {}
+
+        train_signature_batches, selected_train_indices = select_signature_batches(
+            all_train_signature_batches, prewarm_train_signature_indices,
+            'Training')
+        val_signature_batches, selected_validation_indices = select_signature_batches(
+            all_val_signature_batches, prewarm_validation_signature_indices,
+            'Validation')
 
         obs_signature_batches = []
         if hybrid:
@@ -764,9 +803,10 @@ def train(
                     obs_calls))
 
         print('# Prewarming exact sampler trajectory for %d update(s): '
-              '%d train, %d validation static signature(s).'
+              '%d/%d train, %d/%d validation static signature(s).'
               % (planned_updates, len(train_signature_batches),
-                 len(val_signature_batches)))
+                 len(all_train_signature_batches), len(val_signature_batches),
+                 len(all_val_signature_batches)))
         for static_args, batch in train_signature_batches.items():
             jax.block_until_ready(train_step(
                 batch, variables, opt_state, state, static_args))
@@ -781,7 +821,11 @@ def train(
         prewarm_summary = {
             'planned_updates': planned_updates,
             'train_signatures': len(train_signature_batches),
+            'train_signatures_discovered': len(all_train_signature_batches),
+            'train_signature_indices': selected_train_indices,
             'validation_signatures': len(val_signature_batches),
+            'validation_signatures_discovered': len(all_val_signature_batches),
+            'validation_signature_indices': selected_validation_indices,
             'validation_calls': val_calls,
             'elapsed_seconds': prewarm_elapsed,
         }
@@ -795,7 +839,13 @@ def train(
                 'target_updates': step,
                 'prewarm_planned_updates': planned_updates,
                 'prewarm_train_signatures': len(train_signature_batches),
+                'prewarm_train_signatures_discovered': len(
+                    all_train_signature_batches),
+                'prewarm_train_signature_indices': selected_train_indices,
                 'prewarm_validation_signatures': len(val_signature_batches),
+                'prewarm_validation_signatures_discovered': len(
+                    all_val_signature_batches),
+                'prewarm_validation_signature_indices': selected_validation_indices,
                 'prewarm_validation_calls': val_calls,
                 'prewarm_elapsed_seconds': prewarm_elapsed,
                 'checkpoint_path': checkpoint_path,
