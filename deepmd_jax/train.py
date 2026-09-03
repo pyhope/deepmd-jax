@@ -807,9 +807,23 @@ def train(
               % (planned_updates, len(train_signature_batches),
                  len(all_train_signature_batches), len(val_signature_batches),
                  len(all_val_signature_batches)))
+        # A fresh run enters ``train_step`` with the scalar bookkeeping state
+        # as uncommitted host values.  After the first update those same leaves
+        # are committed JAX arrays.  JAX 0.7 records that distinction in
+        # ``allow_spmd_sharding_propagation_to_parameters``, so the cold and
+        # steady-state calls have different persistent-cache keys even though
+        # their shapes and dtypes are identical.  Compile both variants for
+        # every selected static signature.  The second call consumes only the
+        # first call's private result; the real training state remains
+        # untouched.
         for static_args, batch in train_signature_batches.items():
+            warm_variables, warm_opt_state, warm_state = train_step(
+                batch, variables, opt_state, state, static_args)
+            jax.block_until_ready(
+                (warm_variables, warm_opt_state, warm_state))
             jax.block_until_ready(train_step(
-                batch, variables, opt_state, state, static_args))
+                batch, warm_variables, warm_opt_state, warm_state,
+                static_args))
         for static_args, batch in val_signature_batches.items():
             jax.block_until_ready(val_step(batch, variables, static_args))
         for obs_position, signature_batches in enumerate(obs_signature_batches):
@@ -821,6 +835,8 @@ def train(
         prewarm_summary = {
             'planned_updates': planned_updates,
             'train_signatures': len(train_signature_batches),
+            'train_state_sharding_variants': (
+                2 if train_signature_batches else 0),
             'train_signatures_discovered': len(all_train_signature_batches),
             'train_signature_indices': selected_train_indices,
             'validation_signatures': len(val_signature_batches),
@@ -839,6 +855,8 @@ def train(
                 'target_updates': step,
                 'prewarm_planned_updates': planned_updates,
                 'prewarm_train_signatures': len(train_signature_batches),
+                'prewarm_train_state_sharding_variants': (
+                    2 if train_signature_batches else 0),
                 'prewarm_train_signatures_discovered': len(
                     all_train_signature_batches),
                 'prewarm_train_signature_indices': selected_train_indices,

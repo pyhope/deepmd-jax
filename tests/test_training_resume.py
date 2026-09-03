@@ -263,6 +263,7 @@ def test_exact_signature_prewarm_preserves_training_trajectory(tmp_path):
     assert prewarm_result['completed_updates'] == 2
     assert prewarm_result['prewarm_planned_updates'] == 4
     assert prewarm_result['prewarm_train_signatures'] == 1
+    assert prewarm_result['prewarm_train_state_sharding_variants'] == 2
     assert prewarm_result['prewarm_validation_signatures'] == 1
     assert prewarm_checkpoint.read_bytes() == checkpoint_bytes
     assert prewarm_sidecar.read_bytes() == sidecar_bytes
@@ -291,6 +292,7 @@ def test_exact_signature_prewarm_can_select_process_isolated_shards(tmp_path):
         prewarm_train_signature_indices=[0],
         prewarm_validation_signature_indices=[])
     assert train_only['prewarm_train_signatures'] == 1
+    assert train_only['prewarm_train_state_sharding_variants'] == 2
     assert train_only['prewarm_train_signatures_discovered'] == 1
     assert train_only['prewarm_train_signature_indices'] == [0]
     assert train_only['prewarm_validation_signatures'] == 0
@@ -302,6 +304,7 @@ def test_exact_signature_prewarm_can_select_process_isolated_shards(tmp_path):
         prewarm_train_signature_indices=[],
         prewarm_validation_signature_indices=[0])
     assert validation_only['prewarm_train_signatures'] == 0
+    assert validation_only['prewarm_train_state_sharding_variants'] == 0
     assert validation_only['prewarm_validation_signatures'] == 1
     assert validation_only['prewarm_validation_signature_indices'] == [0]
 
