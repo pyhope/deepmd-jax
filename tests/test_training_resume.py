@@ -133,6 +133,58 @@ def test_checkpoint_hash_and_contract_fail_closed(tmp_path):
         train(**contract_kwargs, resume=True)
 
 
+def test_exact_signature_prewarm_preserves_training_trajectory(tmp_path):
+    dataset = tmp_path / 'dataset'
+    _write_dataset(dataset)
+    seed_kwargs = _train_kwargs(
+        dataset, tmp_path / 'seed.pkl', tmp_path / 'seed.train.pkl',
+        tmp_path / 'seed.history.json')
+    seed_result = train(**seed_kwargs, max_updates_per_run=2)
+    assert seed_result['completed_updates'] == 2
+
+    baseline_checkpoint = tmp_path / 'baseline.train.pkl'
+    baseline_sidecar = tmp_path / 'baseline.train.pkl.sha256'
+    prewarm_checkpoint = tmp_path / 'prewarm.train.pkl'
+    prewarm_sidecar = tmp_path / 'prewarm.train.pkl.sha256'
+    for destination, sidecar in (
+            (baseline_checkpoint, baseline_sidecar),
+            (prewarm_checkpoint, prewarm_sidecar)):
+        shutil.copy2(seed_kwargs['checkpoint_path'], destination)
+        shutil.copy2(seed_kwargs['checkpoint_path'] + '.sha256', sidecar)
+
+    baseline_kwargs = _train_kwargs(
+        dataset, tmp_path / 'baseline.pkl', baseline_checkpoint,
+        tmp_path / 'baseline.history.json')
+    baseline_result = train(**baseline_kwargs, resume=True)
+    assert baseline_result['completed']
+
+    prewarm_kwargs = _train_kwargs(
+        dataset, tmp_path / 'prewarm.pkl', prewarm_checkpoint,
+        tmp_path / 'prewarm.history.json')
+    checkpoint_bytes = prewarm_checkpoint.read_bytes()
+    sidecar_bytes = prewarm_sidecar.read_bytes()
+    prewarm_result = train(
+        **prewarm_kwargs, resume=True, prewarm_updates=4, prewarm_only=True)
+    assert prewarm_result['prewarm_only']
+    assert prewarm_result['completed_updates'] == 2
+    assert prewarm_result['prewarm_planned_updates'] == 4
+    assert prewarm_result['prewarm_train_signatures'] == 1
+    assert prewarm_result['prewarm_validation_signatures'] == 1
+    assert prewarm_checkpoint.read_bytes() == checkpoint_bytes
+    assert prewarm_sidecar.read_bytes() == sidecar_bytes
+
+    resumed_result = train(**prewarm_kwargs, resume=True)
+    assert resumed_result['completed']
+    baseline_model, baseline_variables = load_model(
+        baseline_kwargs['save_path'], replicate=False)
+    prewarm_model, prewarm_variables = load_model(
+        prewarm_kwargs['save_path'], replicate=False)
+    assert baseline_model.params == prewarm_model.params
+    _assert_trees_identical(baseline_variables, prewarm_variables)
+    assert json.loads((tmp_path / 'baseline.history.json').read_text()) == json.loads(
+        (tmp_path / 'prewarm.history.json').read_text())
+
+
 def test_dpmp_train_save_reload_and_test(tmp_path):
     dataset = tmp_path / 'dataset'
     _write_dataset(dataset)

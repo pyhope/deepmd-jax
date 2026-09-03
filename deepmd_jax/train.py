@@ -17,6 +17,7 @@ import os
 import hashlib
 import json
 import pickle
+import copy
 
 
 _CHECKPOINT_VERSION = 1
@@ -114,6 +115,8 @@ def train(
     resume: bool = False,
     max_updates_per_run: int = None,
     history_path: str = None,
+    prewarm_updates: int = None,
+    prewarm_only: bool = False,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -168,6 +171,11 @@ def train(
             resume: restore checkpoint_path and continue the exact optimizer and sampling trajectory.
             max_updates_per_run: optional segment cap; useful for sub-hour schedulers. The scientific target remains step.
             history_path: atomic JSON training history path. Defaults to save_path + '.history.json'.
+            prewarm_updates: trace the exact next sampler trajectory for this many
+                updates and compile each distinct train/validation static signature.
+                Sampler, optimizer, model, and history state are restored unchanged.
+            prewarm_only: exit after prewarming without performing or checkpointing
+                any training update. Requires prewarm_updates.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -186,6 +194,10 @@ def train(
         raise ValueError('checkpoint_every must be positive.')
     if max_updates_per_run is not None and max_updates_per_run <= 0:
         raise ValueError('max_updates_per_run must be positive.')
+    if prewarm_updates is not None and prewarm_updates <= 0:
+        raise ValueError('prewarm_updates must be positive.')
+    if prewarm_only and prewarm_updates is None:
+        raise ValueError('prewarm_only requires prewarm_updates.')
     checkpointing = any((checkpoint_path is not None, checkpoint_every is not None,
                          resume, max_updates_per_run is not None))
     if checkpointing and checkpoint_path is None:
@@ -617,6 +629,94 @@ def train(
             else:
                 ret.append(val_data.get_batch(batch_size))
         return ret
+
+    def collect_signature_batches(dataset, get_one_batch, count):
+        """Collect one batch per exact JIT signature without moving the sampler."""
+        sampler_state = copy.deepcopy(dataset.get_sampler_state())
+        signature_batches = {}
+        try:
+            for _ in range(count):
+                batch, type_idx, lattice_args = get_one_batch()
+                static_args = _get_static_args(type_idx, lattice_args)
+                if static_args not in signature_batches:
+                    signature_batches[static_args] = batch
+        finally:
+            dataset.set_sampler_state(sampler_state)
+        return signature_batches
+
+    prewarm_summary = None
+    if prewarm_updates is not None:
+        prewarm_tic = time.time()
+        prewarm_start = int(np.asarray(state['iteration']))
+        prewarm_stop = min(step, prewarm_start + prewarm_updates)
+        planned_updates = prewarm_stop - prewarm_start
+        train_signature_batches = collect_signature_batches(
+            train_data, get_batch_train, planned_updates)
+
+        val_calls = 0
+        if use_val_data:
+            report_count = sum(
+                completed % print_every == 0 or completed == step
+                for completed in range(prewarm_start + 1, prewarm_stop + 1))
+            val_calls = report_count * val_batch_size_ratio
+            val_signature_batches = collect_signature_batches(
+                val_data,
+                lambda: val_data.get_batch(
+                    label_bs if batch_size is None else batch_size,
+                    'label' if batch_size is None else 'frame'),
+                val_calls)
+        else:
+            val_signature_batches = {}
+
+        obs_signature_batches = []
+        if hybrid:
+            obs_calls = sum(
+                iteration % obs_step_every == 0
+                for iteration in range(prewarm_start, prewarm_stop))
+            for obs_position, dataset in enumerate(train_data_obs):
+                obs_signature_batches.append(collect_signature_batches(
+                    dataset,
+                    lambda obs_position=obs_position: get_batch_train_obs(
+                        obs_position=obs_position),
+                    obs_calls))
+
+        print('# Prewarming exact sampler trajectory for %d update(s): '
+              '%d train, %d validation static signature(s).'
+              % (planned_updates, len(train_signature_batches),
+                 len(val_signature_batches)))
+        for static_args, batch in train_signature_batches.items():
+            jax.block_until_ready(train_step(
+                batch, variables, opt_state, state, static_args))
+        for static_args, batch in val_signature_batches.items():
+            jax.block_until_ready(val_step(batch, variables, static_args))
+        for obs_position, signature_batches in enumerate(obs_signature_batches):
+            for static_args, batch in signature_batches.items():
+                jax.block_until_ready(train_step_obs(
+                    batch, variables, opt_state, state_obs, static_args,
+                    obs_position=obs_position))
+        prewarm_elapsed = time.time() - prewarm_tic
+        prewarm_summary = {
+            'planned_updates': planned_updates,
+            'train_signatures': len(train_signature_batches),
+            'validation_signatures': len(val_signature_batches),
+            'validation_calls': val_calls,
+            'elapsed_seconds': prewarm_elapsed,
+        }
+        print('# Prewarm complete in %.2f s; all training state remains unchanged.'
+              % prewarm_elapsed)
+        if prewarm_only:
+            return {
+                'completed': False,
+                'prewarm_only': True,
+                'completed_updates': prewarm_start,
+                'target_updates': step,
+                'prewarm_planned_updates': planned_updates,
+                'prewarm_train_signatures': len(train_signature_batches),
+                'prewarm_validation_signatures': len(val_signature_batches),
+                'prewarm_validation_calls': val_calls,
+                'prewarm_elapsed_seconds': prewarm_elapsed,
+                'checkpoint_path': checkpoint_path,
+            }
         
     # define print step
     def print_step(loss_val, elapsed):
@@ -720,8 +820,11 @@ def train(
             save_training_state()
             print('# Training segment stopped cleanly at update %d/%d.' %
                   (completed, step))
-            return {'completed': False, 'completed_updates': completed,
-                    'target_updates': step, 'checkpoint_path': checkpoint_path}
+            result = {'completed': False, 'completed_updates': completed,
+                      'target_updates': step, 'checkpoint_path': checkpoint_path}
+            if prewarm_summary is not None:
+                result['prewarm'] = prewarm_summary
+            return result
 
     # compress, save, and finish
     save_training_state()
@@ -732,9 +835,13 @@ def train(
                                                 compress_r_min)
     save_model(save_path, model, variables)
     print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.')
-    return {'completed': True, 'completed_updates': int(np.asarray(state['iteration'])),
-            'target_updates': step, 'model_path': save_path,
-            'checkpoint_path': checkpoint_path if checkpointing else None}
+    result = {'completed': True,
+              'completed_updates': int(np.asarray(state['iteration'])),
+              'target_updates': step, 'model_path': save_path,
+              'checkpoint_path': checkpoint_path if checkpointing else None}
+    if prewarm_summary is not None:
+        result['prewarm'] = prewarm_summary
+    return result
 
 
 def test(
