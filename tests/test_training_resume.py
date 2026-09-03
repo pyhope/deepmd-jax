@@ -280,6 +280,33 @@ def test_exact_signature_prewarm_preserves_training_trajectory(tmp_path):
         (tmp_path / 'prewarm.history.json').read_text())
 
 
+def test_signature_change_cache_eviction_preserves_training_result(tmp_path):
+    dataset = tmp_path / 'dataset'
+    _write_dataset(dataset)
+
+    baseline_kwargs = _train_kwargs(
+        dataset, tmp_path / 'baseline.pkl', tmp_path / 'baseline.train.pkl',
+        tmp_path / 'baseline.history.json')
+    bounded_kwargs = _train_kwargs(
+        dataset, tmp_path / 'bounded.pkl', tmp_path / 'bounded.train.pkl',
+        tmp_path / 'bounded.history.json')
+
+    baseline_result = train(**baseline_kwargs)
+    bounded_result = train(
+        **bounded_kwargs, clear_jit_caches_on_signature_change=True)
+    assert baseline_result['completed'] and bounded_result['completed']
+    assert bounded_result['jit_cache_clear_count'] > 0
+
+    baseline_model, baseline_variables = load_model(
+        baseline_kwargs['save_path'], replicate=False)
+    bounded_model, bounded_variables = load_model(
+        bounded_kwargs['save_path'], replicate=False)
+    assert baseline_model.params == bounded_model.params
+    _assert_trees_identical(baseline_variables, bounded_variables)
+    assert json.loads((tmp_path / 'baseline.history.json').read_text()) == json.loads(
+        (tmp_path / 'bounded.history.json').read_text())
+
+
 def test_exact_signature_prewarm_can_select_process_isolated_shards(tmp_path):
     dataset = tmp_path / 'dataset'
     _write_dataset(dataset)

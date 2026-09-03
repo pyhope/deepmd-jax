@@ -171,6 +171,7 @@ def train(
     prewarm_train_signature_indices: List[int] = None,
     prewarm_validation_signature_indices: List[int] = None,
     model_params_path: str = None,
+    clear_jit_caches_on_signature_change: bool = False,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -243,6 +244,11 @@ def train(
                 SHA256 sidecar are required, locally recomputed data statistics
                 must agree numerically, and the checkpoint contract must still
                 match the exact serialized parameters. Resume-only.
+            clear_jit_caches_on_signature_change: clear JAX's in-process
+                compilation caches before changing between distinct train,
+                validation, or observable static signatures. Persistent cache
+                files remain available for reload. This is intended for hosts
+                with constrained executable mapped-section capacity.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -273,6 +279,8 @@ def train(
         raise ValueError('model_params_path is only valid when resuming.')
     if model_params_path is not None and model_type != 'energy':
         raise ValueError('model_params_path currently supports energy models only.')
+    if not isinstance(clear_jit_caches_on_signature_change, bool):
+        raise TypeError('clear_jit_caches_on_signature_change must be boolean.')
     checkpointing = any((checkpoint_path is not None, checkpoint_every is not None,
                          resume, max_updates_per_run is not None))
     if checkpointing and checkpoint_path is None:
@@ -585,6 +593,11 @@ def train(
         # and dtype is unchanged, so retain the already verified file digest.
         'model_params_sha256': model_params_sha256,
     }
+    # Keep the historical default contract byte-for-byte compatible while
+    # binding checkpoints produced by the opt-in mapped-section mitigation to
+    # that execution policy.
+    if clear_jit_caches_on_signature_change:
+        contract['clear_jit_caches_on_signature_change'] = True
     contract_sha256 = hashlib.sha256(
         pickle.dumps(contract, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
     history = []
@@ -703,6 +716,27 @@ def train(
                                  batch,
                                  static_args)
             return loss_total
+
+    active_jit_signature = [None]
+    last_jit_result = [None]
+    jit_cache_clear_count = [0]
+
+    def prepare_jit_signature(kind, static_args, obs_position=None):
+        """Bound live executable caches while preserving persistent entries."""
+        signature = (kind, static_args, obs_position)
+        if (clear_jit_caches_on_signature_change
+                and active_jit_signature[0] is not None
+                and active_jit_signature[0] != signature):
+            if last_jit_result[0] is not None:
+                jax.block_until_ready(last_jit_result[0])
+            jax.clear_caches()
+            jit_cache_clear_count[0] += 1
+        active_jit_signature[0] = signature
+
+    def record_jit_result(result):
+        if clear_jit_caches_on_signature_change:
+            last_jit_result[0] = result
+        return result
         
     # configure batch size
     if batch_size is None:
@@ -817,20 +851,24 @@ def train(
         # first call's private result; the real training state remains
         # untouched.
         for static_args, batch in train_signature_batches.items():
-            warm_variables, warm_opt_state, warm_state = train_step(
-                batch, variables, opt_state, state, static_args)
+            prepare_jit_signature('train', static_args)
+            warm_variables, warm_opt_state, warm_state = record_jit_result(
+                train_step(batch, variables, opt_state, state, static_args))
             jax.block_until_ready(
                 (warm_variables, warm_opt_state, warm_state))
-            jax.block_until_ready(train_step(
+            jax.block_until_ready(record_jit_result(train_step(
                 batch, warm_variables, warm_opt_state, warm_state,
-                static_args))
+                static_args)))
         for static_args, batch in val_signature_batches.items():
-            jax.block_until_ready(val_step(batch, variables, static_args))
+            prepare_jit_signature('validation', static_args)
+            jax.block_until_ready(record_jit_result(
+                val_step(batch, variables, static_args)))
         for obs_position, signature_batches in enumerate(obs_signature_batches):
             for static_args, batch in signature_batches.items():
-                jax.block_until_ready(train_step_obs(
+                prepare_jit_signature('observable', static_args, obs_position)
+                jax.block_until_ready(record_jit_result(train_step_obs(
                     batch, variables, opt_state, state_obs, static_args,
-                    obs_position=obs_position))
+                    obs_position=obs_position)))
         prewarm_elapsed = time.time() - prewarm_tic
         prewarm_summary = {
             'planned_updates': planned_updates,
@@ -848,7 +886,7 @@ def train(
         print('# Prewarm complete in %.2f s; all training state remains unchanged.'
               % prewarm_elapsed)
         if prewarm_only:
-            return {
+            result = {
                 'completed': False,
                 'prewarm_only': True,
                 'completed_updates': prewarm_start,
@@ -868,7 +906,10 @@ def train(
                 'prewarm_elapsed_seconds': prewarm_elapsed,
                 'checkpoint_path': checkpoint_path,
             }
-        
+            if clear_jit_caches_on_signature_change:
+                result['jit_cache_clear_count'] = jit_cache_clear_count[0]
+            return result
+
     # define print step
     def print_step(loss_val, elapsed):
         completed = int(np.asarray(state['iteration']))
@@ -930,11 +971,9 @@ def train(
         iteration = int(np.asarray(state['iteration']))
         batch, type_idx, lattice_args = get_batch_train()
         static_args = _get_static_args(type_idx, lattice_args)
-        variables, opt_state, state = train_step(batch,
-                                                 variables,
-                                                 opt_state,
-                                                 state,
-                                                 static_args)
+        prepare_jit_signature('train', static_args)
+        variables, opt_state, state = record_jit_result(train_step(
+            batch, variables, opt_state, state, static_args))
         
         # training step part 2 in hybrid observable training
         if hybrid and iteration % obs_step_every == 0:
@@ -942,12 +981,10 @@ def train(
             for i in range(len(obs_train_data_path)):
                 batch, type_idx, lattice_args = get_batch_train_obs(obs_position=i)
                 static_args = _get_static_args(type_idx, lattice_args)
-                variables, opt_state, state_obs = train_step_obs(batch,
-                                                        variables,
-                                                        opt_state,
-                                                        state_obs,
-                                                        static_args,
-                                                        obs_position=i) 
+                prepare_jit_signature('observable', static_args, i)
+                variables, opt_state, state_obs = record_jit_result(
+                    train_step_obs(batch, variables, opt_state, state_obs,
+                                   static_args, obs_position=i))
 
         completed = int(np.asarray(state['iteration']))
         report_this_update = completed % print_every == 0 or completed == step
@@ -959,7 +996,9 @@ def train(
                 for one_batch in val_batch:
                     v_batch, type_idx, lattice_args = one_batch
                     static_args = _get_static_args(type_idx, lattice_args)
-                    loss_val.append(val_step(v_batch, variables, static_args))
+                    prepare_jit_signature('validation', static_args)
+                    loss_val.append(record_jit_result(
+                        val_step(v_batch, variables, static_args)))
             print_step(loss_val, time.time() - tic)
             tic = time.time()
 
@@ -975,6 +1014,8 @@ def train(
                       'target_updates': step, 'checkpoint_path': checkpoint_path}
             if prewarm_summary is not None:
                 result['prewarm'] = prewarm_summary
+            if clear_jit_caches_on_signature_change:
+                result['jit_cache_clear_count'] = jit_cache_clear_count[0]
             return result
 
     # compress, save, and finish
@@ -992,6 +1033,8 @@ def train(
               'checkpoint_path': checkpoint_path if checkpointing else None}
     if prewarm_summary is not None:
         result['prewarm'] = prewarm_summary
+    if clear_jit_caches_on_signature_change:
+        result['jit_cache_clear_count'] = jit_cache_clear_count[0]
     return result
 
 
