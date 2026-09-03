@@ -129,7 +129,7 @@ def test_checkpoint_hash_and_contract_fail_closed(tmp_path):
     contract_kwargs = dict(kwargs)
     contract_kwargs['checkpoint_path'] = str(clean_checkpoint)
     contract_kwargs['lr'] = 0.003
-    with pytest.raises(ValueError, match='contract does not match'):
+    with pytest.raises(ValueError, match='differing_fields=lr'):
         train(**contract_kwargs, resume=True)
 
 

@@ -508,7 +508,18 @@ def train(
             raise FileNotFoundError('Training checkpoint not found: %s' % checkpoint_path)
         checkpoint = _load_training_checkpoint(checkpoint_path)
         if checkpoint.get('contract_sha256') != contract_sha256:
-            raise ValueError('Training checkpoint contract does not match this run.')
+            checkpoint_contract = checkpoint.get('contract') or {}
+            differing_fields = sorted(
+                key for key in set(checkpoint_contract) | set(contract)
+                if pickle.dumps(checkpoint_contract.get(key),
+                                protocol=pickle.HIGHEST_PROTOCOL)
+                != pickle.dumps(contract.get(key),
+                                protocol=pickle.HIGHEST_PROTOCOL))
+            raise ValueError(
+                'Training checkpoint contract does not match this run: '
+                'checkpoint_sha256=%s run_sha256=%s differing_fields=%s.' %
+                (checkpoint.get('contract_sha256'), contract_sha256,
+                 ','.join(differing_fields) or '<unavailable>'))
         variables = checkpoint['variables']
         opt_state = checkpoint['opt_state']
         state = checkpoint['state']
