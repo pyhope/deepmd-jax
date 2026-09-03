@@ -9,6 +9,8 @@ import pytest
 
 from deepmd_jax.train import test as evaluate_model
 from deepmd_jax.train import train
+from deepmd_jax.data import Dataset
+from deepmd_jax.dpmodel import DPModel
 from deepmd_jax.utils import load_model
 
 
@@ -63,6 +65,40 @@ def _train_kwargs(dataset, save_path, checkpoint_path, history_path):
     )
 
 
+def _write_portable_energy_params(dataset, path):
+    train_data = Dataset(
+        str(dataset), ['coord', 'box', 'force', 'energy'],
+        {'atomic_sel': None, 'atomic_scalar': False},
+        rng=np.random.default_rng(np.random.SeedSequence([20260901, 0])))
+    train_data.compute_lattice_candidate(2.5, True, False)
+    params = {
+        'type': 'energy',
+        'atomic_data_prefix': None,
+        'embed_widths': [4, 4, 8],
+        'embedMP_widths': None,
+        'fit_widths': [8, 8],
+        'axis': 2,
+        'Ebias': train_data.fit_energy(),
+        'rcut': 2.5,
+        'use_2nd': True,
+        'use_mp': False,
+        'atomic': False,
+        'hybrid': False,
+        'nsel': None,
+        'out_norm': 1.0,
+        **train_data.get_stats(2.5, 2),
+    }
+    portable_raw = pickle.dumps(
+        jax.tree_util.tree_map(
+            lambda value: np.asarray(value) if hasattr(value, 'shape') else value,
+            DPModel(params).params),
+        protocol=pickle.HIGHEST_PROTOCOL)
+    path.write_bytes(portable_raw)
+    path.with_name(path.name + '.sha256').write_text(
+        hashlib.sha256(portable_raw).hexdigest() + f'  {path.name}\n')
+    return portable_raw
+
+
 def _assert_trees_identical(left, right):
     left_leaves = jax.tree_util.tree_leaves(left)
     right_leaves = jax.tree_util.tree_leaves(right)
@@ -80,16 +116,8 @@ def test_segment_resume_matches_continuous_training(tmp_path):
         tmp_path / 'continuous.history.json')
     continuous_result = train(**continuous)
     assert continuous_result['completed']
-    continuous_model, _ = load_model(continuous['save_path'], replicate=False)
     portable_params = tmp_path / 'portable-model-params.pkl'
-    portable_raw = pickle.dumps(
-        jax.tree_util.tree_map(
-            lambda value: np.asarray(value) if hasattr(value, 'shape') else value,
-            continuous_model.params),
-        protocol=pickle.HIGHEST_PROTOCOL)
-    portable_params.write_bytes(portable_raw)
-    portable_params.with_name(portable_params.name + '.sha256').write_text(
-        hashlib.sha256(portable_raw).hexdigest() + '  portable-model-params.pkl\n')
+    portable_raw = _write_portable_energy_params(dataset, portable_params)
 
     segmented = _train_kwargs(
         dataset, tmp_path / 'segmented.pkl', tmp_path / 'segmented.train.pkl',
