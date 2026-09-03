@@ -22,6 +22,17 @@ import copy
 
 _CHECKPOINT_VERSION = 1
 
+# Neighbor-derived statistics are reduced through JAX kernels and can differ
+# slightly between CPU and GPU backends even when the dataset and sampling
+# trajectory are identical.  The portable values remain the actual model
+# contract; these tolerances only validate an independently recomputed guard.
+_PORTABLE_DERIVED_TOLERANCES = {
+    'Ebias': (1e-6, 1e-8),
+    'sr_mean': (2e-4, 1e-8),
+    'sr_std': (2e-4, 1e-8),
+    'Nnbrs': (2e-4, 1e-8),
+}
+
 
 def _path_fingerprint(paths):
     if paths is None:
@@ -82,15 +93,15 @@ def _load_portable_model_params(path, computed_params):
         supplied = pickle.load(file)
     if not isinstance(supplied, dict) or set(supplied) != set(computed_params):
         raise ValueError('Portable model params have incompatible fields.')
-    derived_fields = {'Ebias', 'sr_mean', 'sr_std', 'Nnbrs'}
     for key in supplied:
-        if key in derived_fields:
+        if key in _PORTABLE_DERIVED_TOLERANCES:
             left, right = np.asarray(supplied[key]), np.asarray(computed_params[key])
+            rtol, atol = _PORTABLE_DERIVED_TOLERANCES[key]
             if (left.shape != right.shape or left.dtype != right.dtype
-                    or not np.allclose(left, right, rtol=1e-6, atol=1e-8)):
+                    or not np.allclose(left, right, rtol=rtol, atol=atol)):
                 raise ValueError(
-                    'Portable model params disagree with local data statistics: %s.'
-                    % key)
+                    'Portable model params disagree with local data statistics: '
+                    '%s (rtol=%g, atol=%g).' % (key, rtol, atol))
         elif not _contract_values_equal(supplied[key], computed_params[key]):
             raise ValueError(
                 'Portable model params disagree with the model contract: %s.' % key)
