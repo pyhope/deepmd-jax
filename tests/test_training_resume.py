@@ -102,6 +102,10 @@ def test_segment_resume_matches_continuous_training(tmp_path):
         'checkpoint_path': str(tmp_path / 'segmented.train.pkl'),
     }
     assert not (tmp_path / 'segmented.pkl').exists()
+    with open(segmented['checkpoint_path'], 'rb') as file:
+        checkpoint = pickle.load(file)
+    assert (hashlib.sha256(portable_raw).hexdigest()
+            == checkpoint['contract']['model_params_sha256'])
     resumed_result = train(
         **segmented, resume=True, model_params_path=str(portable_params))
     assert resumed_result['completed']

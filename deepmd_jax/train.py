@@ -77,7 +77,7 @@ def _contract_values_equal(left, right):
 
 def _load_portable_model_params(path, computed_params):
     """Load exact static params while verifying the local data-derived shape."""
-    _verify_sha256_sidecar(path, required=True)
+    supplied_sha256 = _verify_sha256_sidecar(path, required=True)
     with open(path, 'rb') as file:
         supplied = pickle.load(file)
     if not isinstance(supplied, dict) or set(supplied) != set(computed_params):
@@ -95,7 +95,7 @@ def _load_portable_model_params(path, computed_params):
             raise ValueError(
                 'Portable model params disagree with the model contract: %s.' % key)
     print('# Loaded content-addressed portable model params from \'%s\'.' % path)
-    return supplied
+    return supplied, supplied_sha256
 
 def _get_static_args(type_idx, lattice_args):
     return nn.FrozenDict({'type_idx': tuple(type_idx),
@@ -454,8 +454,10 @@ def train(
         'out_norm': scalar_stats[1] if model_type == 'atomic_scalar' else (train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.),
         **train_data.get_stats(rcut, getstat_bs),
     }
+    portable_model_params_sha256 = None
     if model_params_path is not None:
-        params = _load_portable_model_params(model_params_path, params)
+        params, portable_model_params_sha256 = _load_portable_model_params(
+            model_params_path, params)
     if model_type == 'dplr':
         dplr_params = {
             'dplr_wannier_model_and_variables': (wc_model, wc_variables),
@@ -516,6 +518,9 @@ def train(
 
     model_params_raw = pickle.dumps(_tree_to_host(model.params),
                                     protocol=pickle.HIGHEST_PROTOCOL)
+    model_params_sha256 = (portable_model_params_sha256
+                           if portable_model_params_sha256 is not None
+                           else hashlib.sha256(model_params_raw).hexdigest())
     contract = {
         'model_type': model_type,
         'rcut': rcut,
@@ -549,7 +554,11 @@ def train(
         'obs_target': obs_target,
         'obs_step_every': obs_step_every,
         'use_neighbor_list_when_possible': use_neighbor_list_when_possible,
-        'model_params_sha256': hashlib.sha256(model_params_raw).hexdigest(),
+        # A portable file is the content-addressed representation accepted by
+        # the source checkpoint. Re-pickling its loaded tree is not a stable
+        # identity operation across NumPy/JAX backends, even when every value
+        # and dtype is unchanged, so retain the already verified file digest.
+        'model_params_sha256': model_params_sha256,
     }
     contract_sha256 = hashlib.sha256(
         pickle.dumps(contract, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
