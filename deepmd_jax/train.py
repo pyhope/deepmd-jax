@@ -57,6 +57,46 @@ def _write_history(path, history):
     _atomic_write_bytes(path, raw)
     _write_sha256_sidecar(path, hashlib.sha256(raw).hexdigest())
 
+
+def _contract_values_equal(left, right):
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (set(left) == set(right)
+                and all(_contract_values_equal(left[key], right[key])
+                        for key in left))
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return (len(left) == len(right)
+                and all(_contract_values_equal(a, b)
+                        for a, b in zip(left, right)))
+    if hasattr(left, 'shape') or hasattr(right, 'shape'):
+        try:
+            return np.array_equal(np.asarray(left), np.asarray(right))
+        except Exception:
+            return False
+    return left == right
+
+
+def _load_portable_model_params(path, computed_params):
+    """Load exact static params while verifying the local data-derived shape."""
+    _verify_sha256_sidecar(path, required=True)
+    with open(path, 'rb') as file:
+        supplied = pickle.load(file)
+    if not isinstance(supplied, dict) or set(supplied) != set(computed_params):
+        raise ValueError('Portable model params have incompatible fields.')
+    derived_fields = {'Ebias', 'sr_mean', 'sr_std', 'Nnbrs'}
+    for key in supplied:
+        if key in derived_fields:
+            left, right = np.asarray(supplied[key]), np.asarray(computed_params[key])
+            if (left.shape != right.shape or left.dtype != right.dtype
+                    or not np.allclose(left, right, rtol=1e-6, atol=1e-8)):
+                raise ValueError(
+                    'Portable model params disagree with local data statistics: %s.'
+                    % key)
+        elif not _contract_values_equal(supplied[key], computed_params[key]):
+            raise ValueError(
+                'Portable model params disagree with the model contract: %s.' % key)
+    print('# Loaded content-addressed portable model params from \'%s\'.' % path)
+    return supplied
+
 def _get_static_args(type_idx, lattice_args):
     return nn.FrozenDict({'type_idx': tuple(type_idx),
                           'lattice': lattice_args,
@@ -117,6 +157,7 @@ def train(
     history_path: str = None,
     prewarm_updates: int = None,
     prewarm_only: bool = False,
+    model_params_path: str = None,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -176,6 +217,11 @@ def train(
                 Sampler, optimizer, model, and history state are restored unchanged.
             prewarm_only: exit after prewarming without performing or checkpointing
                 any training update. Requires prewarm_updates.
+            model_params_path: optional content-addressed pickle of exact static
+                model parameters for a cross-backend resume. The file and its
+                SHA256 sidecar are required, locally recomputed data statistics
+                must agree numerically, and the checkpoint contract must still
+                match the exact serialized parameters. Resume-only.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -198,6 +244,10 @@ def train(
         raise ValueError('prewarm_updates must be positive.')
     if prewarm_only and prewarm_updates is None:
         raise ValueError('prewarm_only requires prewarm_updates.')
+    if model_params_path is not None and not resume:
+        raise ValueError('model_params_path is only valid when resuming.')
+    if model_params_path is not None and model_type != 'energy':
+        raise ValueError('model_params_path currently supports energy models only.')
     checkpointing = any((checkpoint_path is not None, checkpoint_every is not None,
                          resume, max_updates_per_run is not None))
     if checkpointing and checkpoint_path is None:
@@ -404,6 +454,8 @@ def train(
         'out_norm': scalar_stats[1] if model_type == 'atomic_scalar' else (train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.),
         **train_data.get_stats(rcut, getstat_bs),
     }
+    if model_params_path is not None:
+        params = _load_portable_model_params(model_params_path, params)
     if model_type == 'dplr':
         dplr_params = {
             'dplr_wannier_model_and_variables': (wc_model, wc_variables),

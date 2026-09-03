@@ -1,4 +1,6 @@
 import json
+import hashlib
+import pickle
 import shutil
 
 import jax
@@ -78,6 +80,16 @@ def test_segment_resume_matches_continuous_training(tmp_path):
         tmp_path / 'continuous.history.json')
     continuous_result = train(**continuous)
     assert continuous_result['completed']
+    continuous_model, _ = load_model(continuous['save_path'], replicate=False)
+    portable_params = tmp_path / 'portable-model-params.pkl'
+    portable_raw = pickle.dumps(
+        jax.tree_util.tree_map(
+            lambda value: np.asarray(value) if hasattr(value, 'shape') else value,
+            continuous_model.params),
+        protocol=pickle.HIGHEST_PROTOCOL)
+    portable_params.write_bytes(portable_raw)
+    portable_params.with_name(portable_params.name + '.sha256').write_text(
+        hashlib.sha256(portable_raw).hexdigest() + '  portable-model-params.pkl\n')
 
     segmented = _train_kwargs(
         dataset, tmp_path / 'segmented.pkl', tmp_path / 'segmented.train.pkl',
@@ -90,7 +102,8 @@ def test_segment_resume_matches_continuous_training(tmp_path):
         'checkpoint_path': str(tmp_path / 'segmented.train.pkl'),
     }
     assert not (tmp_path / 'segmented.pkl').exists()
-    resumed_result = train(**segmented, resume=True)
+    resumed_result = train(
+        **segmented, resume=True, model_params_path=str(portable_params))
     assert resumed_result['completed']
 
     continuous_model, continuous_variables = load_model(
