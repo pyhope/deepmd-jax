@@ -307,6 +307,58 @@ def test_signature_change_cache_eviction_preserves_training_result(tmp_path):
         (tmp_path / 'bounded.history.json').read_text())
 
 
+def test_signature_window_preserves_result_and_reduces_cache_clears(tmp_path):
+    dataset = tmp_path / 'dataset'
+    _write_dataset(dataset)
+
+    eager_kwargs = _train_kwargs(
+        dataset, tmp_path / 'eager.pkl', tmp_path / 'eager.train.pkl',
+        tmp_path / 'eager.history.json')
+    windowed_kwargs = _train_kwargs(
+        dataset, tmp_path / 'windowed.pkl', tmp_path / 'windowed.train.pkl',
+        tmp_path / 'windowed.history.json')
+
+    eager_result = train(
+        **eager_kwargs, clear_jit_caches_on_signature_change=True)
+    windowed_result = train(
+        **windowed_kwargs, clear_jit_caches_on_signature_change=True,
+        jit_cache_signature_window=4)
+    assert eager_result['completed'] and windowed_result['completed']
+    assert windowed_result['jit_cache_signature_window'] == 4
+    assert (windowed_result['jit_signature_transition_count']
+            == eager_result['jit_signature_transition_count'])
+    assert (0 < windowed_result['jit_cache_clear_count']
+            < eager_result['jit_cache_clear_count'])
+
+    eager_model, eager_variables = load_model(
+        eager_kwargs['save_path'], replicate=False)
+    windowed_model, windowed_variables = load_model(
+        windowed_kwargs['save_path'], replicate=False)
+    assert eager_model.params == windowed_model.params
+    _assert_trees_identical(eager_variables, windowed_variables)
+    assert json.loads((tmp_path / 'eager.history.json').read_text()) == json.loads(
+        (tmp_path / 'windowed.history.json').read_text())
+
+
+@pytest.mark.parametrize('value,error', [
+    (True, TypeError),
+    (0, ValueError),
+    (2, ValueError),
+])
+def test_signature_window_validation(tmp_path, value, error):
+    dataset = tmp_path / 'dataset'
+    _write_dataset(dataset)
+    kwargs = _train_kwargs(
+        dataset, tmp_path / 'unused.pkl', tmp_path / 'unused.train.pkl',
+        tmp_path / 'unused.history.json')
+    enable_clear = value != 2
+    with pytest.raises(error, match='jit_cache_signature_window'):
+        train(
+            **kwargs,
+            clear_jit_caches_on_signature_change=enable_clear,
+            jit_cache_signature_window=value)
+
+
 def test_exact_signature_prewarm_can_select_process_isolated_shards(tmp_path):
     dataset = tmp_path / 'dataset'
     _write_dataset(dataset)

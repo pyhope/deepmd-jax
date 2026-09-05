@@ -172,6 +172,7 @@ def train(
     prewarm_validation_signature_indices: List[int] = None,
     model_params_path: str = None,
     clear_jit_caches_on_signature_change: bool = False,
+    jit_cache_signature_window: int = 1,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -249,6 +250,13 @@ def train(
                 validation, or observable static signatures. Persistent cache
                 files remain available for reload. This is intended for hosts
                 with constrained executable mapped-section capacity.
+            jit_cache_signature_window: maximum number of static-signature
+                transitions retained between JAX cache clears when
+                clear_jit_caches_on_signature_change is enabled. The default
+                value 1 preserves the historical clear-on-every-change policy;
+                larger values amortize persistent-cache reloads while keeping
+                the number of simultaneously live executable signatures
+                bounded.
         --- Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
             obs_train_data_path: paths to training data with trajectories with observable values.
@@ -281,6 +289,17 @@ def train(
         raise ValueError('model_params_path currently supports energy models only.')
     if not isinstance(clear_jit_caches_on_signature_change, bool):
         raise TypeError('clear_jit_caches_on_signature_change must be boolean.')
+    if (isinstance(jit_cache_signature_window, bool)
+            or not isinstance(jit_cache_signature_window, (int, np.integer))):
+        raise TypeError('jit_cache_signature_window must be an integer.')
+    jit_cache_signature_window = int(jit_cache_signature_window)
+    if jit_cache_signature_window < 1:
+        raise ValueError('jit_cache_signature_window must be at least 1.')
+    if (not clear_jit_caches_on_signature_change
+            and jit_cache_signature_window != 1):
+        raise ValueError(
+            'jit_cache_signature_window requires '
+            'clear_jit_caches_on_signature_change=True.')
     checkpointing = any((checkpoint_path is not None, checkpoint_every is not None,
                          resume, max_updates_per_run is not None))
     if checkpointing and checkpoint_path is None:
@@ -598,6 +617,8 @@ def train(
     # that execution policy.
     if clear_jit_caches_on_signature_change:
         contract['clear_jit_caches_on_signature_change'] = True
+        if jit_cache_signature_window != 1:
+            contract['jit_cache_signature_window'] = jit_cache_signature_window
     contract_sha256 = hashlib.sha256(
         pickle.dumps(contract, protocol=pickle.HIGHEST_PROTOCOL)).hexdigest()
     history = []
@@ -720,17 +741,25 @@ def train(
     active_jit_signature = [None]
     last_jit_result = [None]
     jit_cache_clear_count = [0]
+    jit_signature_transition_count = [0]
+    jit_signature_transitions_since_clear = [0]
 
     def prepare_jit_signature(kind, static_args, obs_position=None):
         """Bound live executable caches while preserving persistent entries."""
         signature = (kind, static_args, obs_position)
-        if (clear_jit_caches_on_signature_change
-                and active_jit_signature[0] is not None
-                and active_jit_signature[0] != signature):
+        changed = (active_jit_signature[0] is not None
+                   and active_jit_signature[0] != signature)
+        if changed:
+            jit_signature_transition_count[0] += 1
+            jit_signature_transitions_since_clear[0] += 1
+        if (clear_jit_caches_on_signature_change and changed
+                and jit_signature_transitions_since_clear[0]
+                >= jit_cache_signature_window):
             if last_jit_result[0] is not None:
                 jax.block_until_ready(last_jit_result[0])
             jax.clear_caches()
             jit_cache_clear_count[0] += 1
+            jit_signature_transitions_since_clear[0] = 0
         active_jit_signature[0] = signature
 
     def record_jit_result(result):
@@ -908,6 +937,9 @@ def train(
             }
             if clear_jit_caches_on_signature_change:
                 result['jit_cache_clear_count'] = jit_cache_clear_count[0]
+                result['jit_cache_signature_window'] = jit_cache_signature_window
+                result['jit_signature_transition_count'] = (
+                    jit_signature_transition_count[0])
             return result
 
     # define print step
@@ -1016,6 +1048,9 @@ def train(
                 result['prewarm'] = prewarm_summary
             if clear_jit_caches_on_signature_change:
                 result['jit_cache_clear_count'] = jit_cache_clear_count[0]
+                result['jit_cache_signature_window'] = jit_cache_signature_window
+                result['jit_signature_transition_count'] = (
+                    jit_signature_transition_count[0])
             return result
 
     # compress, save, and finish
@@ -1035,6 +1070,9 @@ def train(
         result['prewarm'] = prewarm_summary
     if clear_jit_caches_on_signature_change:
         result['jit_cache_clear_count'] = jit_cache_clear_count[0]
+        result['jit_cache_signature_window'] = jit_cache_signature_window
+        result['jit_signature_transition_count'] = (
+            jit_signature_transition_count[0])
     return result
 
 
