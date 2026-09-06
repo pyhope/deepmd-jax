@@ -44,7 +44,10 @@ class DPJaxCalculator(Calculator):
         type_count = np.bincount(self._type_idx)
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
 
-        self._energy_and_forces_fn = self._get_energy_and_forces_fn()
+        (
+            self._energy_and_forces_fn,
+            self._energy_forces_and_stress_fn,
+        ) = self._get_energy_and_forces_fn()
         print("# Initializing the DPJaxCalculator")
 
     def _get_energy_and_forces_fn(self, model_and_variables=None):
@@ -85,6 +88,10 @@ class DPJaxCalculator(Calculator):
                         nbrs_nm=None,
                     )
 
+        def e_and_f(coords, box, static_args, **kwargs):
+            e, grad = jax.value_and_grad(energy_fn)(coords, box, static_args, **kwargs)
+            return e, -grad
+
         def e_and_f_and_s(coords, box, static_args, **kwargs):
             e, grad = jax.value_and_grad(energy_fn)(coords, box, static_args, **kwargs)
             stress = stress_fn(coords, box, static_args, **kwargs)
@@ -100,7 +107,10 @@ class DPJaxCalculator(Calculator):
             # Also, the off-diagonal components have not been tested
             return e, -grad, -stress_voigt
 
-        return jax.jit(e_and_f_and_s, static_argnames=('static_args',))
+        return (
+            jax.jit(e_and_f, static_argnames=('static_args',)),
+            jax.jit(e_and_f_and_s, static_argnames=('static_args',)),
+        )
 
 
     def _get_static_args(self, position):
@@ -132,13 +142,22 @@ class DPJaxCalculator(Calculator):
             print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (static_args['lattice']['lattice_max'], len(static_args['lattice']['lattice_cand'])))
         self._static_args = static_args
 
-        E, F, S = self._energy_and_forces_fn(
-            coords,
-            box,
-            static_args,
-            )
+        requested = set(properties or self.implemented_properties)
+        if "stress" in requested:
+            E, F, S = self._energy_forces_and_stress_fn(
+                coords,
+                box,
+                static_args,
+                )
+            self.results["stress"] = np.asarray(S)
+        else:
+            E, F = self._energy_and_forces_fn(
+                coords,
+                box,
+                static_args,
+                )
 
-        # Convert JAX arrays to numpy
+        # Energy is retained with every force calculation, allowing ASE MD
+        # thermodynamic logging to reuse the same cached result.
         self.results["energy"] = float(E)
         self.results["forces"] = np.asarray(F)
-        self.results["stress"] = np.asarray(S)
