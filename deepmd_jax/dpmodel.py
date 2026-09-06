@@ -28,7 +28,7 @@ class DPModel(nn.Module):
             return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None
             
     @nn.compact
-    def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None):
+    def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None, *, descriptor_only=False):
         if nbrs_nm is None and static_args.get('use_neighborlist', False):
             type_idx = tuple(static_args['type_idx'])
             type_count = tuple(np.bincount(type_idx, minlength=self.params['ntypes']))
@@ -84,6 +84,10 @@ class DPModel(nn.Module):
         if self.params['use_2nd']:
             G2_axis_Nsel6A = tensor_3to6(T_Nsel3W[:,:,A:2*A], axis=1) + T_Nsel6W[:,:,A:2*A]
             G_NselAW += (G2_axis_Nsel6A[...,None] * T_Nsel6W[:,:,None]).sum(1)
+        if descriptor_only:
+            # Preserve every original descriptor parameter name and operation.
+            # Rows follow type-sorted order (K=1); no fitting net is evaluated.
+            return G_NselAW.reshape(G_NselAW.shape[0], -1)
         debug = T_NselXW
         if not self.params['atomic']: # Energy prediction
             fit_n1 = [fitting_net(self.params['fit_widths'])(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),type_count,0,K=K)]
