@@ -24,7 +24,7 @@ class DPJaxCalculator(Calculator):
             dtype=jnp.float32,
             **kwargs):
 
-        self.atoms = None
+        super().__init__(**kwargs)
         self.use_cache = False
         self._dtype = dtype
 

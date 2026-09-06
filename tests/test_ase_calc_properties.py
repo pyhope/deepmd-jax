@@ -37,3 +37,22 @@ def test_ase_calculator_skips_stress_when_only_forces_are_requested():
 
     assert calls == {"force": 1, "stress": 1}
     np.testing.assert_allclose(calc.results["stress"], np.arange(6.0))
+
+
+def test_ase_calculator_uses_base_calculator_initialization(monkeypatch):
+    class DummyModel:
+        params = {"ntypes": 1, "chemical_types": [26]}
+
+    monkeypatch.setattr(
+        "deepmd_jax.ase_calc.load_model", lambda _path: (DummyModel(), object())
+    )
+    monkeypatch.setattr(
+        DPJaxCalculator,
+        "_get_energy_and_forces_fn",
+        lambda self: (object(), object()),
+    )
+
+    calc = DPJaxCalculator("dummy-model.pkl", type_idx=[26])
+
+    assert calc.parameters == {}
+    assert calc.todict() == {}
