@@ -1,4 +1,6 @@
 import json
+import hashlib
+import pickle
 import shutil
 
 import jax
@@ -6,7 +8,9 @@ import numpy as np
 import pytest
 
 from deepmd_jax.train import test as evaluate_model
-from deepmd_jax.train import train
+from deepmd_jax.train import _load_portable_model_params, train
+from deepmd_jax.data import Dataset
+from deepmd_jax.dpmodel import DPModel
 from deepmd_jax.utils import load_model
 
 
@@ -61,12 +65,95 @@ def _train_kwargs(dataset, save_path, checkpoint_path, history_path):
     )
 
 
+def _write_portable_energy_params(dataset, path):
+    train_data = Dataset(
+        str(dataset), ['coord', 'box', 'force', 'energy'],
+        {'atomic_sel': None, 'atomic_scalar': False},
+        rng=np.random.default_rng(np.random.SeedSequence([20260901, 0])))
+    train_data.compute_lattice_candidate(2.5, True, False)
+    params = {
+        'type': 'energy',
+        'atomic_data_prefix': None,
+        'embed_widths': [4, 4, 8],
+        'embedMP_widths': None,
+        'fit_widths': [8, 8],
+        'axis': 2,
+        'Ebias': train_data.fit_energy(),
+        'rcut': 2.5,
+        'use_2nd': True,
+        'use_mp': False,
+        'atomic': False,
+        'hybrid': False,
+        'nsel': None,
+        'out_norm': 1.0,
+        **train_data.get_stats(2.5, 2),
+    }
+    portable_raw = pickle.dumps(
+        jax.tree_util.tree_map(
+            lambda value: np.asarray(value) if hasattr(value, 'shape') else value,
+            DPModel(params).params),
+        protocol=pickle.HIGHEST_PROTOCOL)
+    path.write_bytes(portable_raw)
+    path.with_name(path.name + '.sha256').write_text(
+        hashlib.sha256(portable_raw).hexdigest() + f'  {path.name}\n')
+    return portable_raw
+
+
 def _assert_trees_identical(left, right):
     left_leaves = jax.tree_util.tree_leaves(left)
     right_leaves = jax.tree_util.tree_leaves(right)
     assert len(left_leaves) == len(right_leaves)
     for left_leaf, right_leaf in zip(left_leaves, right_leaves):
         np.testing.assert_array_equal(np.asarray(left_leaf), np.asarray(right_leaf))
+
+
+def _write_pickle_with_sidecar(path, payload):
+    raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    path.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    path.with_name(path.name + '.sha256').write_text(
+        digest + f'  {path.name}\n')
+    return digest
+
+
+def test_portable_params_accept_measured_cpu_gpu_stat_drift(tmp_path):
+    supplied = {
+        'rcut': 6.0,
+        'Ebias': np.array([-0.7870826721191406], dtype=np.float32),
+        'sr_mean': np.array([0.06442106213018153], dtype=np.float64),
+        'sr_std': np.array([0.09724441226940518], dtype=np.float64),
+        'Nnbrs': np.float64(147.59352203147796),
+    }
+    computed = {
+        'rcut': 6.0,
+        'Ebias': supplied['Ebias'].copy(),
+        'sr_mean': np.array([0.06442605329597993], dtype=np.float64),
+        'sr_std': np.array([0.09724652347325068], dtype=np.float64),
+        'Nnbrs': np.float64(147.57904837531368),
+    }
+    path = tmp_path / 'portable.pkl'
+    digest = _write_pickle_with_sidecar(path, supplied)
+    loaded, loaded_digest = _load_portable_model_params(path, computed)
+    _assert_trees_identical(loaded, supplied)
+    assert loaded_digest == digest
+
+
+def test_portable_params_reject_larger_stat_or_contract_drift(tmp_path):
+    supplied = {
+        'rcut': 6.0,
+        'Ebias': np.array([1.0], dtype=np.float32),
+        'sr_mean': np.array([0.06], dtype=np.float64),
+        'sr_std': np.array([0.10], dtype=np.float64),
+        'Nnbrs': np.float64(150.0),
+    }
+    path = tmp_path / 'portable.pkl'
+    _write_pickle_with_sidecar(path, supplied)
+    bad_stats = dict(supplied, sr_mean=np.array([0.061], dtype=np.float64))
+    with pytest.raises(ValueError, match='local data statistics: sr_mean'):
+        _load_portable_model_params(path, bad_stats)
+    bad_contract = dict(supplied, rcut=7.5)
+    with pytest.raises(ValueError, match='model contract: rcut'):
+        _load_portable_model_params(path, bad_contract)
 
 
 def test_segment_resume_matches_continuous_training(tmp_path):
@@ -78,6 +165,8 @@ def test_segment_resume_matches_continuous_training(tmp_path):
         tmp_path / 'continuous.history.json')
     continuous_result = train(**continuous)
     assert continuous_result['completed']
+    portable_params = tmp_path / 'portable-model-params.pkl'
+    portable_raw = _write_portable_energy_params(dataset, portable_params)
 
     segmented = _train_kwargs(
         dataset, tmp_path / 'segmented.pkl', tmp_path / 'segmented.train.pkl',
@@ -90,7 +179,12 @@ def test_segment_resume_matches_continuous_training(tmp_path):
         'checkpoint_path': str(tmp_path / 'segmented.train.pkl'),
     }
     assert not (tmp_path / 'segmented.pkl').exists()
-    resumed_result = train(**segmented, resume=True)
+    with open(segmented['checkpoint_path'], 'rb') as file:
+        checkpoint = pickle.load(file)
+    assert (hashlib.sha256(portable_raw).hexdigest()
+            == checkpoint['contract']['model_params_sha256'])
+    resumed_result = train(
+        **segmented, resume=True, model_params_path=str(portable_params))
     assert resumed_result['completed']
 
     continuous_model, continuous_variables = load_model(
