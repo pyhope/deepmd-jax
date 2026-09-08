@@ -170,6 +170,7 @@ def train(
     fast_resume: bool = True,
     resume_cache_path: str = None,
     executable_cache_dir: str = None,
+    executable_cache_fast_lookup: bool = True,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -226,6 +227,9 @@ def train(
                 energy models. Legacy checkpoints use the original initialization
                 once and acquire a snapshot on their next save. Hybrid/DPLR/atomic
                 models retain the original path in this first implementation.
+            executable_cache_fast_lookup: use a lightweight in-memory route for
+                previously validated batch/static-argument shapes. Set False only
+                to benchmark the legacy per-call full-signature lookup.
             executable_cache_dir: optional trusted, same-runtime compiled binary
                 cache. Skips tracing/lowering on hits. Experimental; enable only
                 with a qualified JAX runtime. Each input shape is cached separately.
@@ -813,7 +817,8 @@ def train(
         print(line)
         history.append(record)
 
-    executables = (ExecutableCache(executable_cache_dir, (contract_sha256, print_loss_smoothing))
+    executables = (ExecutableCache(executable_cache_dir, (contract_sha256, print_loss_smoothing),
+                                   fast_lookup=executable_cache_fast_lookup)
                    if executable_cache_dir is not None and cache_enabled else None)
 
     # training loop

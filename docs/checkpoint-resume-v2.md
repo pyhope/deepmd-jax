@@ -42,3 +42,18 @@ Qualification must compare v1/v2 first resumed update, complete optimizer/sample
 state and a multi-shape trajectory, with exact integer/RNG/order states and a
 preregistered floating tolerance; report process startup, first interval, later
 intervals, steady throughput, memory, cache hits and one-time preparation costs.
+
+## In-memory lookup optimization
+
+Validated batch shape/dtype/weak-type + immutable static arguments now route
+straight to a loaded executable. Full weight/Adam/state pytree flattening,
+stringification, pickling and SHA256 computation happen only for a new route.
+The compiled callable retains JAX's runtime pytree/shape/dtype validation for all
+arguments. Model and optimizer structures are fixed for a training invocation;
+an incompatible state on an existing route is rejected by the compiled callable,
+not silently recompiled. Batch shapes and static arguments remain part of the
+route and trigger a full signature on first encounter. No tensor values are
+hashed. Disk cache identity, file checksums, data/initialization guards and the
+scientific update are unchanged. `lookup_stats` counts full signatures and fast
+route hits. `executable_cache_fast_lookup=False` enables the old lookup path for
+paired performance checks; it does not change the disk-cache keys or the math.

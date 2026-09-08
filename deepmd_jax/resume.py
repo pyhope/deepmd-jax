@@ -97,10 +97,14 @@ class ExecutableCache:
     GPU placement and runtime changes use a new namespace rather than forcing
     an incompatible executable to load.
     """
-    def __init__(self, directory, contract_sha256):
+    def __init__(self, directory, contract_sha256, fast_lookup=True):
         import jax
         self.directory = Path(directory).absolute()
         self.memory = {}
+        self.fast_lookup = fast_lookup
+        self.routes = {}
+        self.lookup_stats = dict(full_signatures=0, route_hits=0)
+
         self.identity = {
             'implementation': implementation_signature(),
             'contract': contract_sha256,
@@ -115,6 +119,23 @@ class ExecutableCache:
         import jax
         import time
         from jax.experimental import serialize_executable
+        # Model/optimizer/state structure is fixed by the training contract.
+        # Route on the changing batch's abstract type and immutable static args;
+        # the loaded Compiled callable still validates ALL runtime arguments.
+        # No tensor values are hashed, copied, or inspected on this fast path.
+        route = None
+        if self.fast_lookup:
+            batch_leaves, batch_tree = jax.tree_util.tree_flatten(dynamic_args[0])
+            batch_types = []
+            for leaf in batch_leaves:
+                aval = jax.core.get_aval(leaf)
+                batch_types.append((tuple(aval.shape), aval.dtype, bool(aval.weak_type)))
+            route = (name, function, batch_tree, tuple(batch_types), static_args)
+            compiled = self.routes.get(route)
+            if compiled is not None:
+                self.lookup_stats['route_hits'] += 1
+                return compiled(*dynamic_args)
+        self.lookup_stats['full_signatures'] += 1
         leaves, tree = jax.tree_util.tree_flatten(dynamic_args)
         abstract = []
         for leaf in leaves:
@@ -143,4 +164,7 @@ class ExecutableCache:
             self.memory[key] = compiled
             print('# Executable cache %s %s %s %.6f s' %
                   (mode, name, key, time.monotonic() - start), flush=True)
-        return self.memory[key](*dynamic_args)
+        compiled = self.memory[key]
+        if route is not None:
+            self.routes[route] = compiled
+        return compiled(*dynamic_args)
