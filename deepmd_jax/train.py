@@ -213,7 +213,7 @@ def train(
             print_loss_smoothing: smoothing factor for loss printing.
             compress_Ngrids: Number of intervals used in compression.
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
-            loss: loss function type, 'l1-mixed' or 'l2'.
+            loss: 'l1-mixed', 'l2', or Fe scalar 'fe-huber' / 'fe-huber-pair' (delta=0.05).
                     'l1-mixed': MAE over configs/atoms, but RMS within each force/atomic vector; more robust to data outliers.
                     'l2': MSE over all entries. This was the old default.
             use_neighbor_list_when_possible: use a simple training neighborlist when the lattice candidate count is one.
@@ -288,7 +288,9 @@ def train(
         else:
             if embed_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
-    assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
+    assert loss in ('l1-mixed', 'l2', 'fe-huber', 'fe-huber-pair')
+    if loss in ('fe-huber', 'fe-huber-pair'):
+        assert model_type == 'atomic_scalar' and atomic_sel == [3]
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
         atomic_data_prefix = {'atomic':'atomic_dipole', 'atomic_t2':'atomic_polarizability', 'atomic_scalar':'atomic_energy'}[model_type]
@@ -734,7 +736,7 @@ def train(
         record = {'update': completed,
                   'learning_rate': float(np.asarray(lr_scheduler(completed - 1)))}
         L_train = float(np.asarray(state["loss_avg"] / beta_smoothing))
-        L_print = L_train if loss == 'l1-mixed' else L_train ** 0.5
+        L_print = L_train ** 0.5 if loss == 'l2' else L_train
         record['loss'] = L_print
         line += f' L {L_print:7.5f}'
         if 'atomic' not in model_type:
@@ -772,7 +774,7 @@ def train(
                 line += f' LFval {LFval_print:7.5f}'
             else:
                 Lval = float(np.array(loss_val).mean())
-                Lval_print = Lval if loss == 'l1-mixed' else Lval ** 0.5
+                Lval_print = Lval ** 0.5 if loss == 'l2' else Lval
                 record['validation_loss'] = Lval_print
                 line += f' Lval {Lval_print:7.5f}'
         line += f' Time {elapsed:.2f}s'

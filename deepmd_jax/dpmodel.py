@@ -5,6 +5,18 @@ import flax.linen as nn
 from .utils import *
 from jax.sharding import PartitionSpec as PSpec
 
+def fe_huber_loss(error, pair=False):
+    """Frame-balanced Fe-site Huber, optionally plus unique Fe-pair Huber."""
+    assert error.ndim == 2  # (frames, selected Fe atoms), in magnetic moment units
+    def huber(e):
+        a = jnp.abs(e)
+        return jnp.where(a <= 0.05, 0.5 * e**2, 0.05 * (a - 0.025))
+    site = huber(error).mean(axis=1)
+    if pair and error.shape[1] > 1:
+        i, j = np.triu_indices(error.shape[1], 1)
+        site = site + huber(error[:, i] - error[:, j]).mean(axis=1)
+    return site.mean()
+
 class DPModel(nn.Module):
     params: dict
     def get_input(self, coord, static_args, nbrs_nm):
@@ -121,6 +133,8 @@ class DPModel(nn.Module):
         return coord_N3[nsel_mask] + wc_relative
     
     def get_loss_fn(self, order='l2'):
+        if order in ('fe-huber', 'fe-huber-pair'):
+            assert self.params['type'] == 'atomic_scalar'
         if self.params['atomic'] is False:
             vmap_energy_and_force = vmap(self.energy_and_force, (None, 0, 0, None))
             def loss_ef(variables, batch_data, pref, static_args):
@@ -142,6 +156,8 @@ class DPModel(nn.Module):
                 pred, _ = vmap_apply(variables, batch_data['coord'], batch_data['box'], static_args)
                 if order == 'l2':
                     return ((batch_data['atomic'] - pred)**2).mean()
+                elif order in ('fe-huber', 'fe-huber-pair'):
+                    return fe_huber_loss(pred - batch_data['atomic'], pair=order == 'fe-huber-pair')
                 elif order == 'l1-mixed':
                     sq = ((batch_data['atomic'] - pred)**2).mean(tuple(range(2,pred.ndim)))
                     return jnp.where(sq > 0, jnp.sqrt(jnp.where(sq > 0, sq, 1.)), 0.).mean()

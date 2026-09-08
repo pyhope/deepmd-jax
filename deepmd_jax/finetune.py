@@ -12,7 +12,7 @@ def inherit_energy(params, variables, source_model, source_variables):
     old = source_model.params
     assert old['type'] == 'energy' and params['type'] == 'atomic_scalar'
     assert params['use_mp'] and old['use_mp']
-    for key in ('rcut', 'embed_widths', 'embedMP_widths', 'fit_widths',
+    for key in ('rcut', 'embed_widths', 'embedMP_widths',
                 'axis', 'use_2nd', 'valid_types', 'ntypes'):
         assert np.array_equal(params[key], old[key]), key
     types = list(params['valid_types']); n = len(types)
@@ -29,7 +29,11 @@ def inherit_energy(params, variables, source_model, source_variables):
                 mapping[f'linear_norm_{4*(a*n+j)+k}'] = f'linear_norm_{4*(i*n+j)+k}'
     for k in range(2*n*n):
         mapping[f'embedding_net_{m*n+k}'] = f'embedding_net_{n*n+k}'
-    for a,i in enumerate(selected): mapping[f'fitting_net_{a}'] = f'fitting_net_{i}'
+    inherit_fit = np.array_equal(params['fit_widths'], old['fit_widths'])
+    if inherit_fit:
+        for a,i in enumerate(selected): mapping[f'fitting_net_{a}'] = f'fitting_net_{i}'
+    else:
+        print('# Fresh magnetic fitting network:', params['fit_widths'])
     copied = 0
     for target,origin in mapping.items():
         a,b=dst['params'][target],src['params'][origin]
@@ -43,7 +47,10 @@ def inherit_energy(params, variables, source_model, source_variables):
         dst['params'][target] = b
         copied += sum(x.size for x in jax.tree_util.tree_leaves(b))
     new=set(dst['params'])-set(mapping)
-    assert new=={f'layer_norm_{i}_{j}' for i in selected for j in range(n)},new
+    expected = {f'layer_norm_{i}_{j}' for i in selected for j in range(n)}
+    if not inherit_fit:
+        expected |= {f'fitting_net_{a}' for a in range(m)}
+    assert new == expected, new
     print('# Finetune semantic module map:', mapping)
     print('# Inherited modules:',len(mapping),'parameters including fresh head:',copied)
     return dst
