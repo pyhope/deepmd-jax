@@ -162,8 +162,6 @@ class DatasetLeaf:
         return self.params
 
     def get_batch(self, batch_size, type='frame'):
-        if type == 'atom':
-            batch_size = int(batch_size / self.natoms + 1)
         if type == 'label':
             batch_size = int(batch_size / self.nlabels + 1)
         if self.pointer + batch_size > self.nframes:

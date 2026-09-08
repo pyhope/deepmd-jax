@@ -168,7 +168,6 @@ def train(
     model_params_path: str = None,
     finetune_model_path: str = None,
     max_seconds_per_run: float = None,
-    auto_batch_by_atoms: bool = False,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -545,7 +544,6 @@ def train(
                            else hashlib.sha256(model_params_raw).hexdigest())
     contract = {
         'finetune_model_sha256': (hashlib.sha256(open(finetune_model_path, 'rb').read()).hexdigest() if finetune_model_path else None),
-        'auto_batch_by_atoms': auto_batch_by_atoms,
         'model_type': model_type,
         'rcut': rcut,
         'train_data_path': _path_fingerprint(train_data_path),
@@ -713,7 +711,7 @@ def train(
         print(f'# Observable loss batch size = {obs_batch_size}')
     def get_batch_train():
         if batch_size is None:
-            return train_data.get_batch(label_bs, 'atom' if auto_batch_by_atoms else 'label')
+            return train_data.get_batch(label_bs, 'label')
         else:
             return train_data.get_batch(batch_size)
     def get_batch_train_obs(obs_position=0):
@@ -722,7 +720,7 @@ def train(
         ret = []
         for _ in range(val_batch_size_ratio):
             if batch_size is None:
-                ret.append(val_data.get_batch(label_bs, 'atom' if auto_batch_by_atoms else 'label'))
+                ret.append(val_data.get_batch(label_bs, 'label'))
             else:
                 ret.append(val_data.get_batch(batch_size))
         return ret
