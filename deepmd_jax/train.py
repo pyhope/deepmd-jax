@@ -17,6 +17,7 @@ import os
 import hashlib
 import json
 import pickle
+from .resume import dataset_manifest, implementation_signature, write_cache, load_cache, ExecutableCache
 
 
 _CHECKPOINT_VERSION = 1
@@ -166,6 +167,9 @@ def train(
     max_updates_per_run: int = None,
     history_path: str = None,
     model_params_path: str = None,
+    fast_resume: bool = True,
+    resume_cache_path: str = None,
+    executable_cache_dir: str = None,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -218,6 +222,16 @@ def train(
             checkpoint_path: atomic training-state checkpoint path. Defaults to save_path + '.train.pkl' when checkpointing is enabled.
             checkpoint_every: save complete model/optimizer/RNG/sampler state every this many updates.
             resume: restore checkpoint_path and continue the exact optimizer and sampling trajectory.
+            fast_resume: reuse a content-bound initialization snapshot for ordinary
+                energy models. Legacy checkpoints use the original initialization
+                once and acquire a snapshot on their next save. Hybrid/DPLR/atomic
+                models retain the original path in this first implementation.
+            executable_cache_dir: optional trusted, same-runtime compiled binary
+                cache. Skips tracing/lowering on hits. Experimental; enable only
+                with a qualified JAX runtime. Each input shape is cached separately.
+            resume_cache_path: immutable initialization snapshot destination;
+                defaults to checkpoint_path + '.init.pkl'. Carry this file and
+                its SHA256 sidecar alongside a checkpoint when moving a run.
             max_updates_per_run: optional segment cap; useful for sub-hour schedulers. The scientific target remains step.
             history_path: atomic JSON training history path. Defaults to save_path + '.history.json'.
             model_params_path: optional content-addressed pickle of exact static
@@ -287,6 +301,28 @@ def train(
             if embed_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
     assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
+    # Restore the checkpoint before allocating throwaway random model/Adam state.
+    startup_tic = time.monotonic()
+    checkpoint = _load_training_checkpoint(checkpoint_path) if resume else None
+    cache_enabled = bool(fast_resume and checkpointing and model_type == 'energy'
+                         and not hybrid and model_params_path is None)
+    cached = None
+    cache_reference = None
+    cache_request = dict(train=_path_fingerprint(train_data_path),
+                         val=_path_fingerprint(val_data_path), rcut=rcut, mp=mp,
+                         getstat_bs=getstat_bs, seed=seed,
+                         use_neighbor_list=use_neighbor_list_when_possible)
+    cache_manifests = None
+    if cache_enabled:
+        cache_manifests = (dataset_manifest(train_data_path), dataset_manifest(val_data_path))
+        cache_reference = checkpoint.get('initialization_cache') if checkpoint else None
+        if cache_reference is not None:
+            if resume_cache_path is not None:
+                cache_reference = dict(cache_reference, path=os.path.abspath(resume_cache_path))
+            cached = load_cache(cache_reference, cache_request, cache_manifests)
+        if resume_cache_path is None:
+            resume_cache_path = checkpoint_path + '.init.pkl'
+    print('# Resume initialization snapshot: %s' % ('HIT' if cached else 'BUILD/LEGACY'), flush=True)
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
         atomic_data_prefix = {'atomic':'atomic_dipole', 'atomic_t2':'atomic_polarizability', 'atomic_scalar':'atomic_energy'}[model_type]
@@ -301,11 +337,14 @@ def train(
     data_params = {'atomic_sel':atomic_sel, 'atomic_scalar':model_type == 'atomic_scalar'}
     dataset_rng = lambda stream: np.random.default_rng(
         np.random.SeedSequence([seed, int(stream)]))
-    train_data = Dataset(train_data_path,
-                           labels,
-                           data_params,
-                           rng=dataset_rng(0))
-    train_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
+    if cached is not None:
+        train_data = cached['train_data']
+    else:
+        train_data = Dataset(train_data_path,
+                               labels,
+                               data_params,
+                               rng=dataset_rng(0))
+        train_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
     chemical_types = train_data.chemical_types
 
     # Setup for hybrid training
@@ -395,13 +434,16 @@ def train(
 
     use_val_data = val_data_path is not None
     if use_val_data:
-        val_data = Dataset(val_data_path,
-                             labels,
-                             data_params,
-                             chemical_types=chemical_types,
-                             rng=dataset_rng(1))
-        val_data.fill_type(train_data.ntypes)
-        val_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
+        if cached is not None:
+            val_data = cached['val_data']
+        else:
+            val_data = Dataset(val_data_path,
+                                 labels,
+                                 data_params,
+                                 chemical_types=chemical_types,
+                                 rng=dataset_rng(1))
+            val_data.fill_type(train_data.ntypes)
+            val_data.compute_lattice_candidate(rcut, use_neighbor_list_when_possible, mp)
     else:
         val_data = None
 
@@ -433,51 +475,58 @@ def train(
                                     use_neighbor_list_when_possible=use_neighbor_list_when_possible)
         print(' Done. Time: %d s' % (time.time() - tic_sr))
 
-    scalar_stats = get_atomic_scalar_stats(train_data, atomic_sel) if model_type == 'atomic_scalar' else None
+    if cached is not None:
+        params = pickle.loads(cached['model_params_raw'])
+        portable_model_params_sha256 = None
+    else:
+        scalar_stats = get_atomic_scalar_stats(train_data, atomic_sel) if model_type == 'atomic_scalar' else None
 
-    # construct model
-    params = {
-        'type': model_type,
-        'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
-        'embed_widths': embed_widths[:-1] if mp else embed_widths,
-        'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
-        'fit_widths': fit_widths,
-        'axis': axis_neurons,
-        'Ebias': scalar_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
-        'rcut': rcut,
-        'use_2nd': True,
-        'use_mp': mp,
-        'atomic': 'atomic' in model_type,
-        'hybrid': hybrid,
-        'nsel': atomic_sel if 'atomic' in model_type else None,
-        'out_norm': scalar_stats[1] if model_type == 'atomic_scalar' else (train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.),
-        **train_data.get_stats(rcut, getstat_bs),
-    }
-    portable_model_params_sha256 = None
-    if model_params_path is not None:
-        params, portable_model_params_sha256 = _load_portable_model_params(
-            model_params_path, params)
-    if model_type == 'dplr':
-        dplr_params = {
-            'dplr_wannier_model_and_variables': (wc_model, wc_variables),
-            'dplr_q_atoms': dplr_q_atoms,
-            'dplr_q_wc': dplr_q_wc,
-            'dplr_beta': dplr_beta,
-            'dplr_resolution': dplr_resolution,
+        # construct model
+        params = {
+            'type': model_type,
+            'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
+            'embed_widths': embed_widths[:-1] if mp else embed_widths,
+            'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
+            'fit_widths': fit_widths,
+            'axis': axis_neurons,
+            'Ebias': scalar_stats[0] if model_type == 'atomic_scalar' else (None if 'atomic' in model_type else train_data.fit_energy()),
+            'rcut': rcut,
+            'use_2nd': True,
+            'use_mp': mp,
+            'atomic': 'atomic' in model_type,
+            'hybrid': hybrid,
+            'nsel': atomic_sel if 'atomic' in model_type else None,
+            'out_norm': scalar_stats[1] if model_type == 'atomic_scalar' else (train_data.get_atomic_label_scale() if 'atomic' in model_type else 1.),
+            **train_data.get_stats(rcut, getstat_bs),
         }
-        params.update(dplr_params)
+        portable_model_params_sha256 = None
+        if model_params_path is not None:
+            params, portable_model_params_sha256 = _load_portable_model_params(
+                model_params_path, params)
+        if model_type == 'dplr':
+            dplr_params = {
+                'dplr_wannier_model_and_variables': (wc_model, wc_variables),
+                'dplr_q_atoms': dplr_q_atoms,
+                'dplr_q_wc': dplr_q_wc,
+                'dplr_beta': dplr_beta,
+                'dplr_resolution': dplr_resolution,
+            }
+            params.update(dplr_params)
     model = DPModel(params)
     print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
 
     # initialize model variables
-    batch, type_idx, lattice_args = train_data.get_batch(1)
-    static_args = _get_static_args(type_idx, lattice_args)
-    variables = model.init(
-                    jax.random.PRNGKey(seed),
-                    batch['coord'][0],
-                    batch['box'][0],
-                    static_args,
-                )
+    if cached is not None:
+        variables = checkpoint['variables']
+    else:
+        batch, type_idx, lattice_args = train_data.get_batch(1)
+        static_args = _get_static_args(type_idx, lattice_args)
+        variables = model.init(
+                        jax.random.PRNGKey(seed),
+                        batch['coord'][0],
+                        batch['box'][0],
+                        static_args,
+                    )
     print('# Model initialized with parameter count %d.' %
            sum(i.size for i in jax.tree_util.tree_flatten(variables)[0]))
     
@@ -495,7 +544,7 @@ def train(
                     )
     optimizer = optax.adam(learning_rate = lr_scheduler,
                            b2 = beta2)
-    opt_state = optimizer.init(variables)
+    opt_state = checkpoint['opt_state'] if cached is not None else optimizer.init(variables)
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn(order=loss)
@@ -515,8 +564,8 @@ def train(
             for k in range(len(obs_train_data_path))
         }
 
-    model_params_raw = pickle.dumps(_tree_to_host(model.params),
-                                    protocol=pickle.HIGHEST_PROTOCOL)
+    model_params_raw = (cached['model_params_raw'] if cached is not None else
+                        pickle.dumps(_tree_to_host(model.params), protocol=pickle.HIGHEST_PROTOCOL))
     model_params_sha256 = (portable_model_params_sha256
                            if portable_model_params_sha256 is not None
                            else hashlib.sha256(model_params_raw).hexdigest())
@@ -566,7 +615,6 @@ def train(
     if resume:
         if checkpoint_path is None or not os.path.isfile(checkpoint_path):
             raise FileNotFoundError('Training checkpoint not found: %s' % checkpoint_path)
-        checkpoint = _load_training_checkpoint(checkpoint_path)
         if checkpoint.get('contract_sha256') != contract_sha256:
             checkpoint_contract = checkpoint.get('contract') or {}
             differing_fields = sorted(
@@ -595,6 +643,14 @@ def train(
         print('# Resumed exact training state at update %d from \'%s\'.' %
               (int(np.asarray(state['iteration'])), checkpoint_path))
 
+    if cache_enabled and cache_reference is None:
+        cache_reference = write_cache(resume_cache_path, {
+            'implementation': implementation_signature(), 'request': cache_request,
+            'manifests': cache_manifests, 'model_params_raw': model_params_raw,
+            'train_data': train_data, 'val_data': val_data,
+        })
+    print('# Initialization ready after %.6f s.' % (time.monotonic() - startup_tic), flush=True)
+
     def save_training_state():
         if not checkpointing:
             return
@@ -614,6 +670,8 @@ def train(
                                     for dataset in train_data_obs]
                                    if hybrid else None),
         }
+        if cache_reference is not None:
+            payload['initialization_cache'] = cache_reference
         _save_training_checkpoint(checkpoint_path, payload)
         _write_history(history_path, history)
         print('# Training checkpoint saved at update %d to \'%s\'.' %
@@ -755,6 +813,9 @@ def train(
         print(line)
         history.append(record)
 
+    executables = (ExecutableCache(executable_cache_dir, (contract_sha256, print_loss_smoothing))
+                   if executable_cache_dir is not None and cache_enabled else None)
+
     # training loop
     tic = time.time()
     segment_start = int(np.asarray(state['iteration']))
@@ -762,11 +823,15 @@ def train(
         iteration = int(np.asarray(state['iteration']))
         batch, type_idx, lattice_args = get_batch_train()
         static_args = _get_static_args(type_idx, lattice_args)
-        variables, opt_state, state = train_step(batch,
-                                                 variables,
-                                                 opt_state,
-                                                 state,
-                                                 static_args)
+        if executables is not None:
+            variables, opt_state, state = executables.call(
+                'train', train_step, (batch, variables, opt_state, state), static_args)
+        else:
+            variables, opt_state, state = train_step(batch,
+                                                     variables,
+                                                     opt_state,
+                                                     state,
+                                                     static_args)
         
         # training step part 2 in hybrid observable training
         if hybrid and iteration % obs_step_every == 0:
@@ -791,7 +856,9 @@ def train(
                 for one_batch in val_batch:
                     v_batch, type_idx, lattice_args = one_batch
                     static_args = _get_static_args(type_idx, lattice_args)
-                    loss_val.append(val_step(v_batch, variables, static_args))
+                    loss_val.append(executables.call(
+                        'validation', val_step, (v_batch, variables), static_args)
+                        if executables is not None else val_step(v_batch, variables, static_args))
             print_step(loss_val, time.time() - tic)
             tic = time.time()
 
