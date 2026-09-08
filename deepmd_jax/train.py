@@ -166,6 +166,9 @@ def train(
     max_updates_per_run: int = None,
     history_path: str = None,
     model_params_path: str = None,
+    finetune_model_path: str = None,
+    max_seconds_per_run: float = None,
+    auto_batch_by_atoms: bool = False,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -466,6 +469,12 @@ def train(
             'dplr_resolution': dplr_resolution,
         }
         params.update(dplr_params)
+    finetune_source = None
+    if finetune_model_path is not None:
+        finetune_source = load_model(finetune_model_path, replicate=False)
+        # Keep the learned descriptor's original input normalization.
+        for key in ('sr_mean', 'sr_std', 'Nnbrs'):
+            params[key] = finetune_source[0].params[key]
     model = DPModel(params)
     print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
 
@@ -481,6 +490,20 @@ def train(
     print('# Model initialized with parameter count %d.' %
            sum(i.size for i in jax.tree_util.tree_flatten(variables)[0]))
     
+    if finetune_source is not None:
+        from .finetune import inherit_energy
+        variables = inherit_energy(params, variables, *finetune_source)
+        if not resume:
+            _, full_features = finetune_source[0].apply(
+                finetune_source[1], batch['coord'][0], batch['box'][0], static_args)
+            _, fe_features = model.apply(
+                variables, batch['coord'][0], batch['box'][0], static_args)
+            ordered_types = np.sort(np.asarray(type_idx))
+            reference = np.asarray(full_features)[np.isin(ordered_types, atomic_sel)]
+            np.testing.assert_allclose(np.asarray(fe_features), reference, rtol=2e-5, atol=2e-5)
+            print('# TRANSFER_FEATURES_PASS max_abs =',
+                  np.max(np.abs(np.asarray(fe_features) - reference)))
+
     # initialize optimizer
     if lr is None:
         lr = 0.002 if 'atomic' not in model_type else 0.01
@@ -521,6 +544,8 @@ def train(
                            if portable_model_params_sha256 is not None
                            else hashlib.sha256(model_params_raw).hexdigest())
     contract = {
+        'finetune_model_sha256': (hashlib.sha256(open(finetune_model_path, 'rb').read()).hexdigest() if finetune_model_path else None),
+        'auto_batch_by_atoms': auto_batch_by_atoms,
         'model_type': model_type,
         'rcut': rcut,
         'train_data_path': _path_fingerprint(train_data_path),
@@ -602,6 +627,7 @@ def train(
             'checkpoint_version': _CHECKPOINT_VERSION,
             'contract_sha256': contract_sha256,
             'contract': contract,
+            'model_params': _tree_to_host(model.params),
             'variables': _tree_to_host(variables),
             'opt_state': _tree_to_host(opt_state),
             'state': _tree_to_host(state),
@@ -687,7 +713,7 @@ def train(
         print(f'# Observable loss batch size = {obs_batch_size}')
     def get_batch_train():
         if batch_size is None:
-            return train_data.get_batch(label_bs, 'label')
+            return train_data.get_batch(label_bs, 'atom' if auto_batch_by_atoms else 'label')
         else:
             return train_data.get_batch(batch_size)
     def get_batch_train_obs(obs_position=0):
@@ -696,7 +722,7 @@ def train(
         ret = []
         for _ in range(val_batch_size_ratio):
             if batch_size is None:
-                ret.append(val_data.get_batch(label_bs, 'label'))
+                ret.append(val_data.get_batch(label_bs, 'atom' if auto_batch_by_atoms else 'label'))
             else:
                 ret.append(val_data.get_batch(batch_size))
         return ret
@@ -797,8 +823,10 @@ def train(
 
         if checkpoint_every is not None and completed % checkpoint_every == 0:
             save_training_state()
-        if (max_updates_per_run is not None
-                and completed - segment_start >= max_updates_per_run
+        if (((max_updates_per_run is not None
+                and completed - segment_start >= max_updates_per_run)
+                or (max_seconds_per_run is not None
+                    and time.time() - TIC >= max_seconds_per_run))
                 and completed < step):
             save_training_state()
             print('# Training segment stopped cleanly at update %d/%d.' %
