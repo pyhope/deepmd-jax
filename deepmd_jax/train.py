@@ -176,6 +176,9 @@ def train(
     max_updates_per_run: int = None,
     history_path: str = None,
     model_params_path: str = None,
+    finetune_model_path: str = None,
+    descriptor_model_path: str = None,
+    max_seconds_per_run: float = None,
     fast_resume: bool = True,
     resume_cache_path: str = None,
     executable_cache_dir: str = None,
@@ -313,11 +316,13 @@ def train(
         else:
             if embed_widths[-1] != fit_widths[-1]:
                 raise ValueError('For atomic models, embed_widths[-1] must equal fit_widths[-1].')
-    assert loss in ('l1-mixed', 'l2'), 'loss must be "l1-mixed" or "l2"'
+    assert loss in ('l1-mixed', 'l2', 'fe-huber', 'fe-huber-pair')
+    if loss in ('fe-huber', 'fe-huber-pair'):
+        assert model_type == 'atomic_scalar' and atomic_sel == [3]
     # Restore the checkpoint before allocating throwaway random model/Adam state.
     startup_tic = time.monotonic()
     checkpoint = _load_training_checkpoint(checkpoint_path) if resume else None
-    cache_enabled = bool(fast_resume and checkpointing and model_type == 'energy'
+    cache_enabled = bool(fast_resume and checkpointing and model_type in ('energy', 'atomic_scalar')
                          and not hybrid and model_params_path is None)
     cached = None
     cache_reference = None
@@ -325,6 +330,12 @@ def train(
                          val=_path_fingerprint(val_data_path), rcut=rcut, mp=mp,
                          getstat_bs=getstat_bs, seed=seed,
                          use_neighbor_list=use_neighbor_list_when_possible)
+    # Bind scalar label identity, initialization assets and normalization to the snapshot.
+    if model_type == 'atomic_scalar':
+        cache_request.update(model_type=model_type, atomic_sel=atomic_sel,
+                             atomic_data_prefix=atomic_data_prefix,
+                             finetune_sha256=(hashlib.sha256(open(finetune_model_path, 'rb').read()).hexdigest() if finetune_model_path else None),
+                             descriptor_sha256=(hashlib.sha256(open(descriptor_model_path, 'rb').read()).hexdigest() if descriptor_model_path else None))
     cache_manifests = None
     if cache_enabled:
         cache_manifests = (dataset_manifest(train_data_path), dataset_manifest(val_data_path))
@@ -525,6 +536,16 @@ def train(
                 'dplr_resolution': dplr_resolution,
             }
             params.update(dplr_params)
+    finetune_source = None
+    if cached is None:
+        if finetune_model_path is not None:
+            finetune_source = load_model(finetune_model_path, replicate=False)
+        normalization_source = (load_model(descriptor_model_path, replicate=False)[0]
+                                if descriptor_model_path else
+                                (finetune_source[0] if finetune_source else None))
+        if normalization_source is not None:
+            for key in ('sr_mean', 'sr_std', 'Nnbrs'):
+                params[key] = normalization_source.params[key]
     model = DPModel(params)
     print('# Model params:', {k:v for k,v in model.params.items() if k != 'dplr_wannier_model_and_variables'})
 
@@ -543,6 +564,20 @@ def train(
     print('# Model initialized with parameter count %d.' %
            sum(i.size for i in jax.tree_util.tree_flatten(variables)[0]))
     
+    if finetune_source is not None:
+        from .finetune import inherit_energy
+        variables = inherit_energy(params, variables, *finetune_source)
+        if not resume:
+            _, full_features = finetune_source[0].apply(
+                finetune_source[1], batch['coord'][0], batch['box'][0], static_args)
+            _, fe_features = model.apply(
+                variables, batch['coord'][0], batch['box'][0], static_args)
+            ordered_types = np.sort(np.asarray(type_idx))
+            reference = np.asarray(full_features)[np.isin(ordered_types, atomic_sel)]
+            np.testing.assert_allclose(np.asarray(fe_features), reference, rtol=2e-5, atol=2e-5)
+            print('# TRANSFER_FEATURES_PASS max_abs =',
+                  np.max(np.abs(np.asarray(fe_features) - reference)))
+
     # initialize optimizer
     if lr is None:
         lr = 0.002 if 'atomic' not in model_type else 0.01
@@ -570,6 +605,10 @@ def train(
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
+    # Explicit initial scalar dtypes match the host checkpoint's restored avals.
+    # Python weak scalars otherwise give first-build and resumed signatures different keys.
+    state = {name: jnp.asarray(value, dtype=jax.dtypes.canonicalize_dtype(np.asarray(value).dtype))
+             for name, value in state.items()}
     if hybrid:
         state_obs = {
             k: {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0.,
@@ -583,6 +622,8 @@ def train(
                            if portable_model_params_sha256 is not None
                            else hashlib.sha256(model_params_raw).hexdigest())
     contract = {
+        'finetune_model_sha256': (hashlib.sha256(open(finetune_model_path, 'rb').read()).hexdigest() if finetune_model_path else None),
+        'descriptor_model_sha256': (hashlib.sha256(open(descriptor_model_path, 'rb').read()).hexdigest() if descriptor_model_path else None),
         'model_type': model_type,
         'rcut': rcut,
         'train_data_path': _path_fingerprint(train_data_path),
@@ -669,6 +710,7 @@ def train(
             'checkpoint_version': _CHECKPOINT_VERSION,
             'contract_sha256': contract_sha256,
             'contract': contract,
+            'model_params': _tree_to_host(model.params),
             'variables': _tree_to_host(variables),
             'opt_state': _tree_to_host(opt_state),
             'state': _tree_to_host(state),
@@ -779,7 +821,7 @@ def train(
         record = {'update': completed,
                   'learning_rate': float(np.asarray(lr_scheduler(completed - 1)))}
         L_train = float(np.asarray(state["loss_avg"] / beta_smoothing))
-        L_print = L_train if loss == 'l1-mixed' else L_train ** 0.5
+        L_print = L_train ** 0.5 if loss == 'l2' else L_train
         record['loss'] = L_print
         line += f' L {L_print:7.5f}'
         if 'atomic' not in model_type:
@@ -817,7 +859,7 @@ def train(
                 line += f' LFval {LFval_print:7.5f}'
             else:
                 Lval = float(np.array(loss_val).mean())
-                Lval_print = Lval if loss == 'l1-mixed' else Lval ** 0.5
+                Lval_print = Lval ** 0.5 if loss == 'l2' else Lval
                 record['validation_loss'] = Lval_print
                 line += f' Lval {Lval_print:7.5f}'
         line += f' Time {elapsed:.2f}s'
@@ -876,8 +918,10 @@ def train(
 
         if checkpoint_every is not None and completed % checkpoint_every == 0:
             save_training_state()
-        if (max_updates_per_run is not None
-                and completed - segment_start >= max_updates_per_run
+        if (((max_updates_per_run is not None
+                and completed - segment_start >= max_updates_per_run)
+                or (max_seconds_per_run is not None
+                    and time.time() - TIC >= max_seconds_per_run))
                 and completed < step):
             save_training_state()
             print('# Training segment stopped cleanly at update %d/%d.' %

@@ -4,6 +4,7 @@ These trusted local pickle artifacts are accelerators, not replacements for
 training checkpoints. Never load artifacts from an untrusted source.
 """
 import hashlib
+import io
 import importlib.metadata
 import os
 from pathlib import Path
@@ -89,6 +90,20 @@ def load_cache(reference, request, manifests):
     return cache
 
 
+def executable_signature_digest(signature):
+    """Hash the complete acyclic signature without Python object-alias topology.
+
+    Pickle memoization can encode equal shape/static metadata differently after
+    a dataset snapshot reload. All types and values are retained; memo references
+    are disabled for this acyclic metadata only, never for stored checkpoints.
+    """
+    buffer = io.BytesIO()
+    writer = pickle.Pickler(buffer, protocol=5)
+    writer.fast = True
+    writer.dump(signature)
+    return hashlib.sha256(buffer.getvalue()).hexdigest()
+
+
 class ExecutableCache:
     """Optional same-runtime binary reuse, bypassing tracing on a cache hit.
 
@@ -142,7 +157,7 @@ class ExecutableCache:
             aval = jax.core.get_aval(leaf)
             abstract.append((tuple(aval.shape), str(aval.dtype), bool(aval.weak_type)))
         signature = (self.identity, name, str(tree), abstract, static_args)
-        key = hashlib.sha256(pickle.dumps(signature, protocol=5)).hexdigest()
+        key = executable_signature_digest(signature)
         if key not in self.memory:
             start = time.monotonic()
             path = self.directory / (name + '-' + key + '.pkl')

@@ -79,3 +79,14 @@ warm executable HIT after a fresh checkpoint deserialization. The numerical
 continuous-versus-segmented regression remains in `tests/test_training_resume.py`.
 The production-sized GPU A/B qualification is separate and was still pending
 when this change was prepared; no GPU speedup is asserted here.
+
+## Dualformat native Fe integration
+
+This campaign branch extends the initialization snapshot and executable cache to
+`atomic_scalar`. The request additionally binds the selected types, atomic label
+prefix, pretrained model hash, and descriptor-normalization model hash. Native
+Fe Huber losses, fresh fitting layers, segment wall-clock stops, and explicit
+model parameters in checkpoints are preserved. The parent device-state placement
+and executable-cache implementation are unchanged. `descriptor_model_path` fixes
+input normalization for both pretrained and random-weight ablations. See the
+campaign INTEGRATION.json and qualification records for exact provenance.
