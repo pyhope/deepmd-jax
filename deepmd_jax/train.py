@@ -63,6 +63,15 @@ def _load_training_checkpoint(path):
     return payload
 
 
+def _restore_training_state(checkpoint):
+    # Checkpoints contain NumPy leaves. Place the dynamic trees on the execution
+    # device so the first resumed cache signature has the same aval/shape sharing
+    # as later JAX updates. Pickle-based keys otherwise encode different aliases
+    # for identical abstract values and can spuriously compile a new executable.
+    return jax.device_put(tuple(checkpoint[name] for name in
+                                ('variables', 'opt_state', 'state')))
+
+
 def _write_history(path, history):
     raw = (json.dumps(history, indent=2, sort_keys=True) + '\n').encode('utf-8')
     _atomic_write_bytes(path, raw)
@@ -632,9 +641,7 @@ def train(
                 'checkpoint_sha256=%s run_sha256=%s differing_fields=%s.' %
                 (checkpoint.get('contract_sha256'), contract_sha256,
                  ','.join(differing_fields) or '<unavailable>'))
-        variables = checkpoint['variables']
-        opt_state = checkpoint['opt_state']
-        state = checkpoint['state']
+        variables, opt_state, state = _restore_training_state(checkpoint)
         history = checkpoint.get('history', [])
         train_data.set_sampler_state(checkpoint['train_sampler_state'])
         if use_val_data:

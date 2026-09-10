@@ -57,3 +57,25 @@ hashed. Disk cache identity, file checksums, data/initialization guards and the
 scientific update are unchanged. `lookup_stats` counts full signatures and fast
 route hits. `executable_cache_fast_lookup=False` enables the old lookup path for
 paired performance checks; it does not change the disk-cache keys or the math.
+
+### Restored device state and executable cache keys
+
+Checkpoint arrays are stored on the host. Resume now places `variables`,
+`opt_state`, and `state` on the execution device after contract validation and
+before the first update. This preserves numerical values while matching the JAX
+abstract-value representation used by ongoing training. Without this placement,
+Python reference sharing in the pickle-encoded signature can give equal shapes
+and dtypes different executable keys on the first resumed call.
+
+The checkpoint format, sampler/RNG restoration, learning-rate schedule and cache
+compatibility checks are unchanged. This addresses a reproducible false miss; it
+does not eliminate legitimate compilation for new shapes, hardware or software.
+Upgrading source changes the implementation signature, so existing initialization
+snapshots and executable caches must still pass the normal compatibility checks.
+Do not overwrite a frozen running campaign's source to apply this change.
+
+`tests/test_checkpoint_device_state.py` checks bitwise state preservation and a
+warm executable HIT after a fresh checkpoint deserialization. The numerical
+continuous-versus-segmented regression remains in `tests/test_training_resume.py`.
+The production-sized GPU A/B qualification is separate and was still pending
+when this change was prepared; no GPU speedup is asserted here.
